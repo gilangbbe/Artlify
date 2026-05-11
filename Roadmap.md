@@ -27,17 +27,18 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 | ------------------------------------------------------------------------------------- | ------------- | ---------- | ------ |
 | Confirm `ml-stable-diffusion` Swift package minimum macOS version                     | resolved (1.1.1, macOS 13.1+) | — | — |
 | Verify Continuity Camera works headlessly (no user gesture each launch)               | resolved (notification-driven auto-switch + manual Reconnect button) | M0 | — |
-| **Convert SD Turbo to CoreML and place it in `~/Library/Application Support/Artlify/Models/sd-turbo/`** | not started   | M1 code    | 1 ed   |
-| Benchmark SD Turbo on M5 base: 512×512, fp16, 2 steps → measure FPS, latency, RAM     | code ready, awaiting model | M1 | 0.25 ed |
-| Confirm zero-copy path from CoreML output (`MLShapedArray`) → `MTLTexture`            | not started   | M1         | 0.5 ed |
+| Convert SD Turbo to CoreML and place it in `~/Library/Application Support/Artlify/Models/sd-turbo/` | resolved (user did the conversion, model loads) | M1 code | — |
+| Benchmark SD Turbo on M5 base: 512×512, fp16, 2 steps → measure FPS, latency, RAM     | **resolved — ~1.0 FPS measured, BELOW the ≥3 FPS target** (see ProjectDocument §13 #1) | M1 | — |
+| Confirm zero-copy path from CoreML output (`MLShapedArray`) → `MTLTexture`            | not started   | M3         | 0.5 ed |
 
 ### P1 — Required for v1
 
 | Item                                                                                  | Status      | Depends on | Effort |
 | ------------------------------------------------------------------------------------- | ----------- | ---------- | ------ |
+| **Diffusion-perf A/Bs given measured 1 FPS** — try 384×384, `.cpuAndGPU`, split UNet/VAE compute units | not started | M3         | 1 ed   |
 | `CaptureKit` module: AVCaptureSession wrapper, `AsyncStream<CVPixelBuffer>`           | done        | M0         | —      |
 | `RenderKit` module: MTKView, texture pool, basic blit pipeline                        | done        | M0         | —      |
-| `VisionKit` module: person seg @ 30 Hz + pose @ 15 Hz, EMA mask smoothing             | not started | M2         | 2 ed   |
+| `VisionKit` module: person seg @ 30 Hz + pose @ 15 Hz, EMA mask smoothing             | done (`.balanced` seg + body pose at 15 Hz cap, runs in single VNImageRequestHandler) | M2         | —      |
 | `DiffusionKit` module: model load, img2img call, error handling, fp16 path            | done        | M1         | —      |
 | FrameRouter actor (latest-frame-wins, drop-stale)                                     | done (folded into `AsyncStream.bufferingNewest(1)` in CaptureKit) | M0 | — |
 | Temporal blend shader (lerp between two AI textures by timestamp)                     | not started | M3         | 1 ed   |
@@ -76,7 +77,7 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 
 | Item                                                                            | Status        | Notes                                                                              |
 | ------------------------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------------------- |
-| **M1 — SD Turbo benchmark on real M5 hardware**                                 | code complete | Requires the user to drop a converted `sd-turbo` `.mlmodelc` bundle into `~/Library/Application Support/Artlify/Models/sd-turbo/`. UI surface (Load → Stylize → FPS) is in place. |
+| **M3 — Live diffusion loop + temporal blend** | not started | Will be designed around the measured 1 FPS diffusion + Vision cost (TBD on next run). Stylized layer updates at ~1 Hz; passthrough draws at 60 Hz; Metal blend shader interpolates between the two latest stylized textures. |
 
 ---
 
@@ -84,6 +85,8 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 
 | Item                                                                                       | Date       |
 | ------------------------------------------------------------------------------------------ | ---------- |
+| **M2 — VisionKit shipped** — `VisionFrame`, `VisionProcessor` actor (`.balanced` seg + body pose), `VisionSession` polling driver @ 15 Hz, `PoseOverlay` SwiftUI canvas with skeleton + dots, HUD toggle | 2026-05-11 |
+| **M1 verified on hardware** — SD Turbo img2img runs end-to-end, 997 ms / pass measured (~1 FPS, below the ≥3 FPS prediction). ProjectDocument §13 #1 updated with the real number. | 2026-05-11 |
 | **M1 scaffold** — `DiffusionKit` actor (img2img, CFG=0, dpm-solver, reduceMemory), benchmark UI, model-folder reveal | 2026-05-11 |
 | M1 first-run bugfix — `PixelBufferToCGImage` now produces guaranteed-exact 512×512 output via fixed-size `CGContext`, avoiding `Encoder.Error.sampleInputShapeNotCorrect` | 2026-05-11 |
 | Added `apple/ml-stable-diffusion` SwiftPM dependency (1.1.1) via direct pbxproj edit       | 2026-05-11 |

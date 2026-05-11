@@ -38,6 +38,68 @@ Build still green, zero warnings.
 
 ---
 
+## 2026-05-11 — M1 verified on hardware: 1 FPS @ 2 steps, 512×512 (below assumption)
+
+**Decision / change:**
+First successful run on the M5 base printed:
+
+```
+img2img: 0.997 s, 2 steps, strength 0.550000, 512x512
+```
+
+So **~1.0 FPS** for a single img2img pass with `disableSafety: true`, `reduceMemory: true`, `guidanceScale = 0`, dpm-solver, `.cpuAndNeuralEngine`, fp16 SD-Turbo at 512×512.
+
+This is **below** the ≥3 FPS prediction in `ProjectDocument.md` §13 assumption #1. It's within 2× of the prediction, so the project is not dead — but it changes M3's design pressure significantly. Specifically:
+
+- The temporal-blend strategy in §7 is now load-bearing, not optional. We were going to need it anyway, but now the live UI must be willing to display the camera frame for ~1 s while the next stylized frame computes.
+- The "render at camera FPS, blend the latest stylized frame" pattern remains correct — Metal can still draw at 60 Hz; only the *replacement* of the stylized layer is throttled.
+- 2 steps is already the floor for SD-Turbo (1 step degrades quality noticeably). Other levers we have: (a) drop spatial resolution to 384×384 (~30–40 % faster), (b) try `.cpuAndGPU` instead of `.cpuAndNeuralEngine` (sometimes faster on Apple Silicon for img2img — worth a 30-second A/B), (c) keep the VAE on GPU and only the UNet on ANE.
+
+We don't tune those yet — first we want M2 (Vision) so we can see whether person-segmentation cost eats into the same budget.
+
+**Reason:**
+The whole point of the M1 benchmark was to get a real number. Now we have one. Replacing the wishful "≥3 FPS" with "≈1 FPS measured" lets every later milestone make decisions against reality.
+
+**Impact:**
+- `ProjectDocument.md` §13 assumption #1 is updated below to "1 FPS measured; design must tolerate this".
+- M3 will be designed around a roughly 1 Hz stylized-layer update with 60 Hz passthrough underneath, plus temporal blend. Adding faster paths (resolution drop, compute-unit A/B) is added to the roadmap as P1 optimisations to attempt before any UI polish.
+- Build still green, zero warnings.
+
+**Follow-up:**
+After M2 lands and we know Vision's cost, decide whether to attempt the 384×384 / `.cpuAndGPU` A/Bs before M3 or fold them into M3's optimisation pass.
+
+---
+
+## 2026-05-11 — M2 shipped: VisionKit (person seg + body pose), debug overlay live
+
+**Decision / change:**
+Built the Vision pipeline end-to-end behind the same actor + @Observable pattern we used for diffusion:
+
+- `Artlify/VisionKit/VisionFrame.swift` — Sendable value type carrying the segmentation mask (`CVPixelBuffer?`, `OneComponent8`), an array of `VisionJoint { id, point, confidence }`, processing time, source dimensions, and timestamp. Marked `@unchecked Sendable` because `CVPixelBuffer` does not declare Sendable conformance — same exception we took for `CameraCapture`.
+- `Artlify/VisionKit/VisionProcessor.swift` — Swift `actor` wrapping one `VNGeneratePersonSegmentationRequest` (quality `.balanced`, `OneComponent8` output) and one `VNDetectHumanBodyPoseRequest`. Both run inside a single `VNImageRequestHandler.perform([...])` call so they share image-decoding work. Joints below confidence 0.2 are dropped at the boundary.
+- `Artlify/AppShell/VisionSession.swift` — `@MainActor @Observable` driver. Polls `CameraSession.latestPixelBuffer` at a target cadence (default 15 Hz, configurable), runs one pass at a time (re-entrancy is gated by the actor), maintains an EMA of processing time, exposes `latestFrame` for the UI.
+- `Artlify/AppShell/PoseOverlay.swift` — SwiftUI `Canvas` overlay that draws the skeleton (16 hand-listed bones) + joint dots in normalized → view coordinates with a Y flip and aspect-fill compensation that mirrors the Metal renderer.
+- `ContentView` now owns a `VisionSession`, starts it in `onAppear`, draws the overlay (toggleable from the HUD via a "Vision" button), and adds a status line: `vision: <ms> (<Hz>) · <N> joints · mask: yes/no`.
+
+`xcodebuild build` is green with **zero warnings**.
+
+**Reason:**
+M2 delivers the inputs M3 needs to do anything more interesting than full-frame img2img: a soft alpha mask of the person (so we can stylize *only* the person and keep the background passthrough sharp) and a skeleton (which M4 will use for prompt nudges and to detect motion for blend weighting). Building Vision *before* the diffusion live-loop means M3 can budget GPU/ANE time against a known Vision cost, not a guess.
+
+`.balanced` segmentation quality is the documented sweet spot on Apple Silicon — far cleaner edges than `.fast`, ~3× faster than `.accurate`. We will revisit once we measure thermals at 30 minutes.
+
+The polling driver (vs. fanning out CaptureKit's AsyncStream) keeps CameraSession unaware of downstream consumers and naturally enforces latest-frame-wins: if Vision is slow, intermediate frames are simply skipped, never queued.
+
+**Impact:**
+- One new module (`VisionKit/`) in the source tree.
+- ~15 Hz Vision passes will eat some GPU; we'll see whether this hurts the 1 FPS diffusion number when both run together — that measurement is the M3 entry checklist.
+- Pose overlay toggles off by default in production but is on for development; flip the `@State private var showVisionOverlay` default before shipping.
+
+**Follow-up:**
+Run the app, confirm pose overlay tracks the body smoothly, and read the `vision: <ms>` HUD line to record actual Vision cost on the M5. That number plus the existing 1 FPS diffusion number is the budget M3 will design around.
+
+---
+
 ## 2026-05-11 — M1 first-run bugfix: VAE encoder rejected the camera frame
 
 **Decision / change:**

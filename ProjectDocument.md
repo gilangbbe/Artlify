@@ -262,7 +262,7 @@ Models are **downloaded on first launch** from Hugging Face into `~/Library/Appl
 
 Stated explicitly so we can revisit:
 
-1. **Assumption:** SD Turbo at 512×512, 2 steps, fp16, achieves ≥3 FPS on M5 base. *To be benchmarked in M1.*
+1. ~~**Assumption:** SD Turbo at 512×512, 2 steps, fp16, achieves ≥3 FPS on M5 base. *To be benchmarked in M1.*~~ **Measured (2026-05-11): ~1.0 FPS (≈997 ms / pass)** with `disableSafety`, `reduceMemory`, `guidanceScale=0`, dpm-solver, `.cpuAndNeuralEngine`, fp16. Below the original target. Implication: M3 must run on the assumption that the stylized layer updates at ~1 Hz while the passthrough draws at 60 Hz; temporal blend (§7) is now load-bearing, not optional. Optimisations to attempt before M4: 384×384 spatial, `.cpuAndGPU` A/B, split UNet/VAE across compute units.
 2. **Assumption:** Continuity Camera latency is acceptable (<150 ms end-to-end). *To be measured in M0.*
 3. **Assumption:** A single foreground person is the dominant use case; multi-person is a v2 concern.
 4. **Open:** Do we want a "kiosk mode" (auto-fullscreen, no UI) for installations? Defer until after v1 demo.

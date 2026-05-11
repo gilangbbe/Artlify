@@ -12,11 +12,21 @@ import SwiftUI
 struct ContentView: View {
     @State private var session = CameraSession()
     @State private var benchmark = DiffusionBenchmark()
+    @State private var vision = VisionSession()
+    @State private var showVisionOverlay = true
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             CameraMetalView(renderer: session.renderer)
                 .ignoresSafeArea()
+
+            if showVisionOverlay {
+                GeometryReader { proxy in
+                    PoseOverlay(frame: vision.latestFrame, viewSize: proxy.size)
+                        .allowsHitTesting(false)
+                }
+                .ignoresSafeArea()
+            }
 
             statusHUD
                 .padding(12)
@@ -29,8 +39,14 @@ struct ContentView: View {
         }
         .frame(minWidth: 720, minHeight: 480)
         .background(Color.black)
-        .onAppear { session.start() }
-        .onDisappear { session.stop() }
+        .onAppear {
+            session.start()
+            vision.start(consuming: session)
+        }
+        .onDisappear {
+            vision.stop()
+            session.stop()
+        }
     }
 
     @ViewBuilder
@@ -48,6 +64,7 @@ struct ContentView: View {
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
+            visionStatusLine
             HStack(spacing: 6) {
                 if !session.availableDevices.isEmpty {
                     Menu {
@@ -74,6 +91,11 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                Toggle(isOn: $showVisionOverlay) {
+                    Label("Vision", systemImage: "figure.stand")
+                }
+                .toggleStyle(.button)
+                .controlSize(.small)
             }
             .font(.caption2)
         }
@@ -88,6 +110,20 @@ struct ContentView: View {
         case .starting: return "starting…"
         case .running:  return "live"
         case .failed(let msg): return "error: \(msg)"
+        }
+    }
+
+    @ViewBuilder
+    private var visionStatusLine: some View {
+        let ms = vision.smoothedProcessingSeconds * 1000.0
+        let fps = vision.smoothedProcessingSeconds > 0 ? 1.0 / vision.smoothedProcessingSeconds : 0
+        let jointCount = vision.latestFrame?.joints.count ?? 0
+        let hasMask = vision.latestFrame?.personMask != nil
+        if vision.passCount > 0 {
+            Text(String(format: "vision: %.0f ms (%.1f Hz) · %d joints · mask: %@",
+                        ms, fps, jointCount, hasMask ? "yes" : "no"))
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
         }
     }
 
