@@ -8,6 +8,7 @@
 //
 
 import Foundation
+import CoreVideo
 import Observation
 import OSLog
 
@@ -30,7 +31,14 @@ final class CameraSession {
 
     private(set) var status: Status = .idle
     private(set) var firstFrameLatencyMS: Double?
+    private(set) var activeDeviceName: String?
+    private(set) var availableDevices: [CameraDeviceInfo] = []
     private var startedAt: CFAbsoluteTime = 0
+    private var deviceRefreshTask: Task<Void, Never>?
+
+    /// The most recently received pixel buffer. Used by the diffusion
+    /// benchmark to grab a still without disturbing the render loop.
+    private(set) var latestPixelBuffer: CVPixelBuffer?
 
     init() {
         do {
@@ -59,10 +67,24 @@ final class CameraSession {
                 return
             }
             self.status = .running
+            self.activeDeviceName = capture.currentDeviceName
             for await pb in capture.frames() {
                 if Task.isCancelled { break }
                 self.recordFirstFrameIfNeeded()
+                self.latestPixelBuffer = pb
                 renderer.submit(pb)
+            }
+        }
+
+        // Refresh the device list periodically so the picker reflects
+        // Continuity Cameras that wake up after launch.
+        deviceRefreshTask?.cancel()
+        deviceRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let devices = CameraCapture.availableDevices()
+                self?.availableDevices = devices
+                self?.activeDeviceName = self?.capture.currentDeviceName
+                try? await Task.sleep(for: .seconds(1))
             }
         }
     }
@@ -70,9 +92,21 @@ final class CameraSession {
     func stop() {
         pumpTask?.cancel()
         pumpTask = nil
+        deviceRefreshTask?.cancel()
+        deviceRefreshTask = nil
         capture.stop()
         status = .idle
         firstFrameLatencyMS = nil
+        activeDeviceName = nil
+    }
+
+    /// Re-run device discovery and rebind to the preferred device. If
+    /// `deviceID` is nil, the same priority list as `start()` is used
+    /// (Continuity Camera first).
+    func reconnect(deviceID: String? = nil) {
+        firstFrameLatencyMS = nil
+        startedAt = CFAbsoluteTimeGetCurrent()
+        capture.reconnect(preferredDeviceID: deviceID)
     }
 
     private func recordFirstFrameIfNeeded() {

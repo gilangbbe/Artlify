@@ -11,7 +11,7 @@
 //  default video device is used.
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -54,12 +54,33 @@ nonisolated public final class CameraCapture: NSObject, @unchecked Sendable {
     private let session = AVCaptureSession()
     private let output = AVCaptureVideoDataOutput()
     private var currentInput: AVCaptureDeviceInput?
+    private var preferContinuityCamera = true
 
     /// Latest-frame continuation. Replaced when `frames()` is called again.
     private var continuation: AsyncStream<CVPixelBuffer>.Continuation?
 
     public override init() {
         super.init()
+        // Observe device-connection notifications so that a Continuity Camera
+        // appearing after the session has already started (the common case on
+        // second launch — the iPhone hasn't been activated yet) automatically
+        // becomes the active input.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDeviceConnected(_:)),
+            name: AVCaptureDevice.wasConnectedNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDeviceDisconnected(_:)),
+            name: AVCaptureDevice.wasDisconnectedNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     // MARK: - Public API
@@ -140,6 +161,60 @@ nonisolated public final class CameraCapture: NSObject, @unchecked Sendable {
             if self.session.isRunning { self.session.stopRunning() }
             self.continuation?.finish()
             self.continuation = nil
+        }
+    }
+
+    /// Force a re-pick of the camera. Useful when the user manually plugs in
+    /// the iPhone after launch and wants to switch to it.
+    public func reconnect(preferredDeviceID: String? = nil) {
+        sessionQueue.async {
+            do {
+                try self.configureLocked(preferredDeviceID: preferredDeviceID)
+                if !self.session.isRunning { self.session.startRunning() }
+            } catch {
+                self.log.error("reconnect failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    /// Name of the currently active capture device, if any. Safe to call from any thread.
+    public var currentDeviceName: String? {
+        sessionQueue.sync { currentInput?.device.localizedName }
+    }
+
+    // MARK: - Notifications
+
+    @objc private func handleDeviceConnected(_ note: Notification) {
+        guard let device = note.object as? AVCaptureDevice,
+              device.hasMediaType(.video) else { return }
+        log.info("Device connected: \(device.localizedName, privacy: .public) [\(device.deviceType.rawValue, privacy: .public)]")
+
+        // If a Continuity Camera shows up and we are currently using something else,
+        // auto-switch to it. This is the fix for "iPhone only connects on first launch".
+        sessionQueue.async {
+            guard self.preferContinuityCamera,
+                  device.deviceType == .continuityCamera,
+                  self.currentInput?.device.deviceType != .continuityCamera else { return }
+            do {
+                try self.configureLocked(preferredDeviceID: device.uniqueID)
+                if !self.session.isRunning { self.session.startRunning() }
+            } catch {
+                self.log.error("auto-switch to Continuity Camera failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    @objc private func handleDeviceDisconnected(_ note: Notification) {
+        guard let device = note.object as? AVCaptureDevice else { return }
+        log.info("Device disconnected: \(device.localizedName, privacy: .public)")
+        sessionQueue.async {
+            // If our active device went away, fall back to whatever is left.
+            guard self.currentInput?.device.uniqueID == device.uniqueID else { return }
+            do {
+                try self.configureLocked(preferredDeviceID: nil)
+            } catch {
+                self.log.error("fallback after disconnect failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 

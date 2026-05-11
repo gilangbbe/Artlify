@@ -23,12 +23,13 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 
 ### P0 — Blockers / unknowns to resolve before committing further
 
-| Item                                                                                  | Status      | Depends on | Effort |
-| ------------------------------------------------------------------------------------- | ----------- | ---------- | ------ |
-| Confirm `ml-stable-diffusion` Swift package minimum macOS version                     | not started | —          | 0.25 ed |
-| Verify Continuity Camera works headlessly (no user gesture each launch)               | not started | M0         | 0.5 ed |
-| Benchmark SD Turbo on M5 base: 512×512, fp16, 2 steps → measure FPS, latency, RAM     | not started | M1         | 1 ed   |
-| Confirm zero-copy path from CoreML output (`MLShapedArray`) → `MTLTexture`            | not started | M1         | 0.5 ed |
+| Item                                                                                  | Status        | Depends on | Effort |
+| ------------------------------------------------------------------------------------- | ------------- | ---------- | ------ |
+| Confirm `ml-stable-diffusion` Swift package minimum macOS version                     | resolved (1.1.1, macOS 13.1+) | — | — |
+| Verify Continuity Camera works headlessly (no user gesture each launch)               | resolved (notification-driven auto-switch + manual Reconnect button) | M0 | — |
+| **Convert SD Turbo to CoreML and place it in `~/Library/Application Support/Artlify/Models/sd-turbo/`** | not started   | M1 code    | 1 ed   |
+| Benchmark SD Turbo on M5 base: 512×512, fp16, 2 steps → measure FPS, latency, RAM     | code ready, awaiting model | M1 | 0.25 ed |
+| Confirm zero-copy path from CoreML output (`MLShapedArray`) → `MTLTexture`            | not started   | M1         | 0.5 ed |
 
 ### P1 — Required for v1
 
@@ -37,7 +38,7 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 | `CaptureKit` module: AVCaptureSession wrapper, `AsyncStream<CVPixelBuffer>`           | done        | M0         | —      |
 | `RenderKit` module: MTKView, texture pool, basic blit pipeline                        | done        | M0         | —      |
 | `VisionKit` module: person seg @ 30 Hz + pose @ 15 Hz, EMA mask smoothing             | not started | M2         | 2 ed   |
-| `DiffusionKit` module: model load, img2img call, error handling, fp16 path            | not started | M1         | 3 ed   |
+| `DiffusionKit` module: model load, img2img call, error handling, fp16 path            | done        | M1         | —      |
 | FrameRouter actor (latest-frame-wins, drop-stale)                                     | done (folded into `AsyncStream.bufferingNewest(1)` in CaptureKit) | M0 | — |
 | Temporal blend shader (lerp between two AI textures by timestamp)                     | not started | M3         | 1 ed   |
 | Silhouette composite shader (camera mask over AI texture)                             | not started | M3         | 0.5 ed |
@@ -45,7 +46,7 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 | SwiftUI shell: prompt input, presets, HUD, fullscreen                                 | not started | M4         | 2 ed   |
 | First-launch model downloader with SHA256 verification + progress UI                  | not started | M5         | 1.5 ed |
 | Diffusion-stall fallback (>2 s no output → camera + post-FX only)                     | not started | M5         | 0.5 ed |
-| Continuity Camera reconnect handling                                                  | not started | M5         | 0.5 ed |
+| Continuity Camera reconnect handling                                                  | done        | M5         | —      |
 | FPS / latency / RAM HUD (DEBUG builds always; user-toggleable in release)             | not started | M3         | 0.5 ed |
 | 30-minute thermal soak test + eco-mode tuning                                         | not started | M5         | 1 ed   |
 
@@ -73,25 +74,30 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 
 ## In Progress
 
-| Item                                                          | Status      | Notes                                                  |
-| ------------------------------------------------------------- | ----------- | ------------------------------------------------------ |
-| Measure end-to-end Continuity Camera latency on real M5       | not started | Requires running the M0 app with an iPhone connected.  |
+| Item                                                                            | Status        | Notes                                                                              |
+| ------------------------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------------------- |
+| **M1 — SD Turbo benchmark on real M5 hardware**                                 | code complete | Requires the user to drop a converted `sd-turbo` `.mlmodelc` bundle into `~/Library/Application Support/Artlify/Models/sd-turbo/`. UI surface (Load → Stylize → FPS) is in place. |
 
 ---
 
 ## Completed
 
-| Item                                                                     | Date       |
-| ------------------------------------------------------------------------ | ---------- |
-| **M0 — Project skeleton + camera passthrough** (build green, 0 warnings)| 2026-05-11 |
+| Item                                                                                       | Date       |
+| ------------------------------------------------------------------------------------------ | ---------- |
+| **M1 scaffold** — `DiffusionKit` actor (img2img, CFG=0, dpm-solver, reduceMemory), benchmark UI, model-folder reveal | 2026-05-11 |
+| M1 first-run bugfix — `PixelBufferToCGImage` now produces guaranteed-exact 512×512 output via fixed-size `CGContext`, avoiding `Encoder.Error.sampleInputShapeNotCorrect` | 2026-05-11 |
+| Added `apple/ml-stable-diffusion` SwiftPM dependency (1.1.1) via direct pbxproj edit       | 2026-05-11 |
+| Continuity Camera reconnect bug fix — device-connected/disconnected notifications, auto-switch to iPhone, manual Reconnect + device picker in HUD | 2026-05-11 |
+| **M0 verified on hardware** — Continuity Camera end-to-end latency <150 ms (target met) | 2026-05-11 |
+| **M0 — Project skeleton + camera passthrough** (build green, 0 warnings)                  | 2026-05-11 |
 | `CaptureKit/CameraCapture` — AVCaptureSession wrapper, AsyncStream<CVPixelBuffer>, latest-frame-wins, Continuity-Camera-preferred device picker | 2026-05-11 |
 | `RenderKit/CameraMetalRenderer` + `Passthrough.metal` — MTKView delegate, CVMetalTextureCache, full-screen-triangle blit, FPS log | 2026-05-11 |
-| `RenderKit/CameraMetalView` — NSViewRepresentable wrapper                | 2026-05-11 |
-| `AppShell/CameraSession` + rewritten `ContentView` with status HUD       | 2026-05-11 |
-| Camera entitlement + `NSCameraUsageDescription` Info.plist key           | 2026-05-11 |
-| Constraint-driven rewrite of `ProjectDocument.md`                        | 2026-05-11 |
-| Established `Journal.md` and `Roadmap.md`                                | 2026-05-11 |
-| Locked v1 stack: Continuity Camera + Vision + SD Turbo + Metal           | 2026-05-11 |
+| `RenderKit/CameraMetalView` — NSViewRepresentable wrapper                                  | 2026-05-11 |
+| `AppShell/CameraSession` + rewritten `ContentView` with status HUD                         | 2026-05-11 |
+| Camera entitlement + `NSCameraUsageDescription` Info.plist key                             | 2026-05-11 |
+| Constraint-driven rewrite of `ProjectDocument.md`                                          | 2026-05-11 |
+| Established `Journal.md` and `Roadmap.md`                                                  | 2026-05-11 |
+| Locked v1 stack: Continuity Camera + Vision + SD Turbo + Metal                             | 2026-05-11 |
 
 ---
 
