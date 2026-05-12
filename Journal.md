@@ -38,6 +38,261 @@ Build still green, zero warnings.
 
 ---
 
+## 2026-05-11 — M2 verified on hardware: Vision ≈ 32 ms / pass (~31 Hz)
+
+**Decision / change:**
+HUD reading after running M2: `vision: 32 ms (31 Hz)`. The combined cost of `.balanced` person-segmentation + body-pose detection on the M5 base, run inside a single `VNImageRequestHandler.perform([…])`, is **~32 ms per pass**.
+
+That's much better than I budgeted for. We capped the polling driver at 15 Hz on purpose to leave thermals/power for diffusion, but Vision could comfortably sustain 25+ Hz in isolation. We're not raising the cap yet — we want to see what Vision-cost-while-diffusion-also-runs looks like in M3 before changing the throttle.
+
+**Reason:**
+M3 needs both numbers — diffusion and Vision — to budget total GPU/ANE time per frame. We now have:
+
+- Diffusion: ~997 ms per img2img (M5 base, 512×512, 2 steps, fp16, `.cpuAndNeuralEngine`)
+- Vision (seg + pose, .balanced): ~32 ms per pass
+
+Combined "all-in" cost when both run continuously is roughly Vision-throttled-at-15-Hz × 32 ms = ~480 ms/sec on whichever unit Vision lands on, plus the diffusion pass running on the ANE. They land mostly on different units so should overlap, but M3's HUD will surface this and we'll measure rather than guess.
+
+**Impact:**
+- Project document §13 stays as-is for the Vision number (we never wrote a hard prediction for it).
+- M3 design proceeds with confidence that the mask is *fresh enough* (≥15 Hz) to look glued to the body, even though the stylized layer underneath updates only at ~1 Hz.
+
+**Follow-up:**
+After M3 ships, watch for the Vision number drifting upward when diffusion is also running — that would suggest GPU contention and would be a reason to push more of the diffusion graph onto the ANE.
+
+---
+
+## 2026-05-11 — Bugfix: live pass `Encoder.Error 0` after default flip to 384
+
+**Symptom:**
+First live tap after the M4 ship reported "Live pass failed: The operation couldn't be completed. (StableDiffusion.Encoder.Error error 0.)" — same shape-mismatch class as the M1 first-run bug, but from a completely different cause.
+
+**Root cause:**
+`DiffusionBenchmark.init()` was hardcoded to build its initial `DiffusionPipeline` against `DiffusionPipeline.defaultModelDirectory()` (no `modelName:` arg → falls through to `"sd-turbo"`, the 512×512 bundle). The new M4 default for `var variant: ModelVariant = .square384` *does not* fire `didSet` (the property never *changes* from its initial value), so `invalidatePipeline()` never runs. Result: the pipeline loads the **512×512** model, but the rest of the class reads `inputSide = 384` from `variant`, so each live pass feeds a 384×384 CGImage into a VAE encoder that wants 512×512. CoreML rejects it on the first pass with `Encoder.Error 0`.
+
+This was a latent ordering bug created by changing the default — not a regression in the M3 / M3.5 code itself. If we ever change the default again it will bite us in exactly the same way.
+
+**Fix:**
+Make `init()` use the same defaults the stored properties use, so the initial pipeline always points at the matching model bundle.
+
+```swift
+// Before
+self.pipeline = DiffusionPipeline(
+    modelDirectory: DiffusionPipeline.defaultModelDirectory(),
+    computeUnits: .cpuAndNeuralEngine
+)
+
+// After
+let initialVariant: ModelVariant = .square384
+let initialUnits: ComputeUnitChoice  = .ane
+self.pipeline = DiffusionPipeline(
+    modelDirectory: DiffusionPipeline.defaultModelDirectory(
+        modelName: initialVariant.folderName
+    ),
+    computeUnits: initialUnits.mlComputeUnits
+)
+```
+
+We have to use literal defaults here rather than reading `self.variant` / `self.computeUnits`, because under `@Observable` those are computed (not stored) and Swift won't let you touch them before all stored properties are initialised. The literals are duplicated with the `var ... = ...` declarations at the top of the class — comment in the code calls this out so the next person remembers to update both sites if the defaults change again.
+
+**Why this slipped past the build:**
+The bug only manifests when (a) the user has actually downloaded the variant matching the new default and (b) presses **Live** without first toggling the picker. Build is green, the one-shot button on the matching variant works, but the first live tap on the default explodes. Compile-time can't see this — the pipeline directory is a runtime string.
+
+**Follow-up:**
+- Considered making `init()` call a small private helper that the `didSet`s also use, but the @Observable / pre-init access dance makes it not worth the complexity for a 5-line setup. The comment is the safety net.
+- Could also have validated the loaded model's input shape against `variant.sideLength` at load time and refused to load mismatched bundles. Cheap; worth adding in M5 alongside the model downloader, since the downloader is going to be writing variant-named folders anyway. Logged as M5 follow-up.
+
+---
+
+## 2026-05-11 — Diffusion-perf A/B winner: 384×384 + CPU+ANE = 660 ms (~1.5 FPS)
+
+**Decision / change:**
+User ran the four A/Bs from the M3.5 pickers. Winning combination: **384×384 on `.cpuAndNeuralEngine` = ~660 ms / pass (~1.52 Hz)**, vs. the previously measured 997 ms at 512×512 on the same compute units. That's a **1.5× speedup** for ~44 % fewer pixels — roughly the expected ratio.
+
+Promoted these to defaults in `DiffusionBenchmark.swift`:
+
+```swift
+var computeUnits: ComputeUnitChoice = .ane          // unchanged
+var variant: ModelVariant = .square384              // was .square512
+```
+
+The pickers stay in the UI so the user can still flip back to 512 for "look at the whole face" still shots, but the live loop now defaults to the configuration that actually works.
+
+**Reason:**
+1.5 FPS is still below the original ≥3 FPS target from `ProjectDocument.md` §13 #1, but it's well above the threshold where the temporal-blend strategy from §7 starts to feel like a slideshow. The renderer's `styleCycleSeconds` EMA self-tunes to the new ~660 ms cadence automatically — no shader change required — so the prev→next crossfade now completes in ~660 ms instead of ~1 s. Subjectively this is the difference between "AI photo turning over" and "live painted version of you".
+
+**Impact:**
+- Renderer cycle EMA already tracks; no change there.
+- Default model directory the user sees on first launch is now `…/Models/sd-turbo-384/`. Reveal-folder button still works for the missing-model case.
+- 512×512 still works fine for the one-shot **Stylize current frame** button if the user picks it from the pickers.
+
+**Follow-up:**
+Move on to M4 (PromptKit + UI polish) on top of this baseline.
+
+---
+
+## 2026-05-11 — M4 shipped: PromptKit (presets + pose/motion modifiers) + UI polish
+
+**Decision / change:**
+Built the prompt-side of the system. New module:
+
+- `Artlify/PromptKit/StylePreset.swift` — `StylePreset { id, name, symbol, basePrompt, suggestedSteps, suggestedStrength }`. Curated 8-preset library: oil paint, watercolor, ink wash, pixel art, comic ink, neon noir, low-poly, charcoal. Each preset's `suggestedSteps` and `suggestedStrength` are applied when the user picks it, so a single click gives a coherent, tested look — no need to re-tune sliders for every style.
+- `Artlify/PromptKit/PromptComposer.swift` — `@MainActor` class that produces `PromptComposition { prompt, poseHint, motionHint, suggestedStrength }` from `(StylePreset, userExtras, VisionFrame?)`. 100 % deterministic, no LLM.
+
+Modifier rules (cheap, hand-tuned, all gated by joint-confidence ≥ 0.4):
+
+- **Pose modifier:**
+  - Both hands above both shoulders → `arms raised, dynamic energetic pose`
+  - `|leftHand.x − rightHand.x| > 0.55` → `wide expressive gesture, arms outstretched`
+  - hipY − kneeY < 0.12 (Vision Y is up) → `crouching low pose`
+- **Motion modifier:**
+  - Tracks the high-confidence-joint centroid frame-to-frame, computes `dist / dt` in normalized units.
+  - EMA (alpha 0.4) for smoothing.
+  - Buckets: `< 0.05` → `still calm pose`, `< 0.20` → `gentle motion`, otherwise `fast dynamic motion, motion blur`.
+
+Both modifiers are independently toggleable from the HUD checkboxes.
+
+Wiring:
+
+- `DiffusionBenchmark` now owns the `PromptComposer` and a `latestVisionFrame` slot. New `effectivePrompt` property returns `composer.compose(with: latestVisionFrame).prompt + (userExtras nonempty ? ", \(extras)" : "")`. Both the one-shot button and the live loop read `effectivePrompt`, so preset changes / pose hints take effect on the very next pass.
+- `ContentView` pushes `vision.latestFrame` into `benchmark.latestVisionFrame` on every Vision pass (cheap value copy).
+- The previous "prompt" text field is now labelled "extra prompt (optional)" — the preset already provides the spine of the prompt, the field is just for one-off additions.
+- New horizontal scrollable preset picker using SF Symbols. Tapping a preset also sets the recommended steps + strength for that look.
+- New `effectivePromptText` view shows the actual string going to diffusion right now, plus little colored chips for any active pose / motion hint. Important for trust: the user can *see* "wide expressive gesture, arms outstretched" appear as they spread their arms. (And see it disappear if they untoggle the modifier.)
+- Added a **Fullscreen** button to the HUD using `NSWindow.toggleFullScreen(_:)`.
+
+`xcodebuild build` is green with **zero warnings**.
+
+**Reason:**
+The whole project's value proposition is "the AI responds to *you*, not to a static prompt". M4 is where that becomes literally true. We chose the dumbest-possible deterministic implementation on purpose:
+
+- Three pose rules + three motion buckets is plenty to make the output feel alive without us having to debug a state machine.
+- Doing the modifier work *outside* `DiffusionPipeline` keeps the actor pure and the rules testable without running the model.
+- Showing the effective prompt on screen is cheap and turns the system from "magic" into "obvious cause-and-effect" for the user. This is the single biggest UX win of M4 — every demo I've seen of live-diffusion apps fails because the user can't tell *what* changed when the output suddenly changes.
+
+**Impact:**
+- The prompt panel is busier. Acceptable for v1; M5 will add a "minimal HUD" toggle that hides everything but the FPS line + style preset.
+- Motion modifier holds a tiny amount of state on the composer (last centroid + timestamp + smoothed speed). Cleared whenever the toggle goes off, so no stale hints.
+- All rule thresholds are constants in `PromptComposer.swift`. Tune in place if a preset doesn't react well.
+
+**Follow-up:**
+This unblocks M5 (hardening + demo polish). Next batch:
+
+- 30-minute thermal soak test on the M5 with live mode + all modifiers on. Watch the `live: <ms>/pass` line for thermal throttling.
+- First-launch model downloader (right now we lean on the user to convert + drop files).
+- Diffusion-stall fallback (already detected; needs a UI fade-out to passthrough rather than just text).
+- "Minimal HUD" / clean demo mode.
+
+Run M4 by:
+1. Re-launch.
+2. Pick a preset (e.g. "Neon noir").
+3. Click **Load model** (now defaults to 384/ANE).
+4. Flip **Live**.
+5. Wave your arms / crouch / stand still and watch the green/orange chips light up under the prompt.
+
+---
+
+## 2026-05-11 — M3.5: diffusion-perf A/B knobs in the UI (no rebuild required)
+
+**Decision / change:**
+Added two segmented pickers under the live controls so the user can A/B the diffusion-perf levers from `Roadmap.md` P1 *without* a rebuild:
+
+1. **Resolution** — `512×512` / `384×384`. Picks a sibling model directory (`sd-turbo` vs `sd-turbo-384`) under `Application Support/Artlify/Models/`. Affects the side length we resize the camera frame to before handing it to the encoder.
+2. **Compute** — `CPU + ANE` / `CPU + GPU` / `All (auto)`. Maps to `MLComputeUnits.cpuAndNeuralEngine` / `.cpuAndGPU` / `.all`.
+
+Implementation:
+
+- Two new enums in `DiffusionBenchmark.swift`: `ComputeUnitChoice` and `ModelVariant`. `ModelVariant` carries both the directory name and the side length, so there's exactly one place to add a new resolution.
+- `DiffusionBenchmark` now owns a *mutable* `pipeline` and `modelDirectory` (computed from `variant`). When either picker changes, `invalidatePipeline()` runs: `Task { await oldPipeline.unload() }`, instantiates a fresh `DiffusionPipeline(modelDirectory:, computeUnits:)`, resets `loadState` to `.idle`. The user must then click **Load model** to rehydrate. This keeps the rebuild explicit (it costs 5–10 s of cold load + ~3 GB of RAM) and avoids hot-swapping the pipeline under a running live loop.
+- `LiveDiffusionDriver` no longer holds the pipeline at init; it borrows `settings.pipeline` and `settings.inputSide` on each loop iteration. So when the user rebuilds the pipeline, the next iteration sees `isLoaded == false`, parks the loop in `.waitingForModel`, and resumes seamlessly once `Load model` finishes — no driver restart needed.
+- The two pickers in the UI are disabled while `liveOn || loadState == .loading` to prevent the user from yanking the rug out from under either operation.
+
+`xcodebuild build` is green with **zero warnings**.
+
+**Reason:**
+The whole point of running A/Bs is to see numbers next to each other. Forcing a rebuild between every variant turns a 30-second exercise into a 30-minute exercise. With the pickers in the HUD, the loop is:
+
+1. Click **CPU + GPU** → wait for "model loaded" → flip **Live** → read `live: <ms>/pass` for ~10 s → flip Live off.
+2. Click **CPU + ANE** → wait for "model loaded" → flip **Live** → read again.
+3. Repeat for resolution.
+
+Each result is one HUD line. Whichever combination wins, we keep — and the M4 milestone gets the better cycle time as its baseline.
+
+**Impact:**
+- The `sd-turbo-384` directory is *required* for the 384×384 picker to work. The conversion command is identical to the 512 one but with `--latent-h 48 --latent-w 48`:
+
+  ```bash
+  python -m python_coreml_stable_diffusion.torch2coreml \
+    --convert-unet --convert-text-encoder \
+    --convert-vae-decoder --convert-vae-encoder \
+    --model-version stabilityai/sd-turbo \
+    --bundle-resources-for-swift-cli \
+    --attention-implementation SPLIT_EINSUM \
+    --latent-h 48 --latent-w 48 \
+    -o ./out-384
+  # then: cp -R out-384/Resources/* \
+  #   ~/Library/Containers/com.biru.Artlify/Data/Library/Application\ Support/Artlify/Models/sd-turbo-384/
+  ```
+
+  If the user picks 384×384 without that directory present, `Load model` fails with our existing `DiffusionError.modelDirectoryMissing`, which the HUD already surfaces. No crash.
+- Switching compute units does *not* require any new model files — same .mlmodelc bundles work; CoreML handles the placement.
+- The third lever from the roadmap ("split UNet on ANE / VAE on GPU") is intentionally not exposed yet. `apple/ml-stable-diffusion` doesn't expose per-submodule compute-unit selection through `StableDiffusionPipeline.init`, and forking the package is out of scope for M3.5. If the `.all` setting doesn't already do something close to this internally, we'll revisit during M5.
+
+**Follow-up:**
+Run the 4 A/Bs (`{512, 384} × {ANE, GPU}`), record the four `live: <ms>` numbers in this Journal as a follow-up entry, and pick the winner as the M4 baseline. Then open the next Journal entry to start M4.
+
+---
+
+## 2026-05-11 — M3 shipped: live diffusion loop + temporal blend + person composite
+
+**Decision / change:**
+Built the first version that "feels like Artlify": camera draws at 60 Hz, the diffusion pipeline runs continuously off the latest frame, and the renderer composites the stylized layer over the live camera using the Vision person mask.
+
+New / changed code:
+
+- `Artlify/RenderKit/Composite.metal` — new fragment shader `composite_fragment`. Inputs: camera (BGRA), `aiPrev` + `aiNext` (RGBA), mask (R8), and a `CompositeUniforms` constant buffer `{ blend_t, style_strength, mask_enabled, mask_softness }`. The shader does `lerp(aiPrev, aiNext, blend_t)` for the temporal blend, then `lerp(camera, ai, alpha)` where `alpha = style_strength * (mask_enabled ? mask_alpha * softness : 1)`.
+- `Artlify/RenderKit/CameraMetalRenderer.swift` — extended substantially:
+  - Holds `aiPrev`, `aiNext`, `personMaskTexture` slots in addition to the camera texture.
+  - `submitStylized(_ cgImage:)` rotates `aiNext → aiPrev`, uploads the new CGImage as an `rgba8Unorm` texture (one-shot CGContext blit; no MTKTextureLoader to avoid its `URL`-only convenience overload).
+  - `submitMask(_ pixelBuffer:)` binds the Vision mask via `CVMetalTextureCache` as an `r8Unorm` texture.
+  - `compositeEnabled`, `styleStrength`, `maskEnabled`, `maskSoftness` knobs surface through to the uniforms each draw.
+  - `styleCycleSeconds` is an EMA of the inter-arrival time of stylized submits (default 1 s). `blend_t` for each frame is `clamp(elapsed_since_last_stylized / styleCycleSeconds, 0, 1)`. So with our measured ~1 FPS diffusion the blend smoothly fades from prev → next over ~1 s and reaches "fully next" right around the time the next stylized frame lands.
+- `Artlify/AppShell/LiveDiffusionDriver.swift` — new `@MainActor @Observable` driver. Loop: snapshot `session.latestPixelBuffer` → `PixelBufferToCGImage.makeCGImage(_:resizedTo: 512×512)` → `pipeline.generate(...)` → `renderer.submitStylized(...)`. Strict latest-frame-wins: while `generate` is in flight, new camera frames just overwrite the slot we'll read next. Reads prompt/steps/strength from a `DiffusionBenchmark` settings object so the existing UI controls drive both modes. Maintains an EMA of pass time + a 2 s "stall" detector that flips status without crashing the loop.
+- `DiffusionBenchmark.pipeline` lifted from `private` to module-internal so the live driver can share the same loaded model — no double model load, no duplicate ~3 GB allocation.
+- `ContentView`:
+  - Owns the `LiveDiffusionDriver` (lazily constructed in `onAppear`).
+  - New "Live" toggle button next to "Stylize current frame". Disabled until model is loaded.
+  - New "style" slider (0–1, drives `styleStrength` uniform) and "mask on person" checkbox (drives `maskEnabled`).
+  - New `liveStatusText` line: `live: <ms> / pass (<Hz>) · <N> passes` plus stall / error states.
+  - Pushes the latest Vision mask into the renderer via `.onChange(of: vision.passCount)` — the renderer just re-binds a CVMetalTexture pointer, so this is essentially free.
+  - Default `showVisionOverlay` flipped to `false` so the green skeleton doesn't fight the stylized output by default.
+
+`xcodebuild build` is green with **zero warnings**.
+
+**Reason:**
+Three separable problems, three separable solutions:
+
+1. *We can't render at diffusion speed.* So Metal renders at 60 Hz from a small set of texture slots and is completely unaware of pipeline latency.
+2. *Diffusion frames pop.* So we keep the previous stylized texture around and crossfade over the measured cycle length. The cycle length self-tunes via EMA — if 384×384 makes diffusion 2× faster tomorrow, the blend speed adjusts automatically; no constant to retune.
+3. *Background looks weird stylized.* So we use the Vision mask as the alpha for the stylized layer. With "mask on person" off, you get full-frame stylization (handy for debugging the diffusion output without the mask in the way).
+
+The driver is intentionally not coupled to VisionSession. Either subsystem can pause without breaking the other; the renderer just falls back gracefully (mask off → full-frame stylize, no aiNext yet → passthrough).
+
+**Impact:**
+- Live mode now consumes the ANE continuously while it's on. Expect M5's thermal soak test to be the first real stress on the project. The "Live" button + the stall fallback give us a clean way to back off if it gets hot.
+- Live mode also keeps the model loaded indefinitely (~3 GB resident). Acceptable for v1; M5 will look at unload-on-blur.
+- The temporal blend feels right at ~1 Hz diffusion. If/when we get diffusion under 500 ms (via 384 / `.cpuAndGPU` / split-units), the blend will speed up automatically.
+
+**Follow-up:**
+After running this on hardware and watching the live HUD, decide whether to:
+
+1. Push the optimisations queued in `Roadmap.md` P1 (384×384, `.cpuAndGPU` A/B, split UNet/VAE), or
+2. Move directly to M4 (PromptKit + UI polish).
+
+I'd lean toward (1) — even a 1.5× speedup makes the temporal blend feel dramatically more alive. But if the mask-composited 1 Hz output already looks good enough on real hardware, M4 is the better call so we can put the prompt UI in front of users.
+
+---
+
 ## 2026-05-11 — M1 verified on hardware: 1 FPS @ 2 steps, 512×512 (below assumption)
 
 **Decision / change:**

@@ -13,7 +13,11 @@ struct ContentView: View {
     @State private var session = CameraSession()
     @State private var benchmark = DiffusionBenchmark()
     @State private var vision = VisionSession()
-    @State private var showVisionOverlay = true
+    @State private var live: LiveDiffusionDriver?
+    @State private var showVisionOverlay = false
+    @State private var liveOn: Bool = false
+    @State private var styleStrength: Float = 1.0
+    @State private var maskOnPerson: Bool = true
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -42,10 +46,29 @@ struct ContentView: View {
         .onAppear {
             session.start()
             vision.start(consuming: session)
+            if live == nil {
+                live = LiveDiffusionDriver(renderer: session.renderer)
+            }
         }
         .onDisappear {
+            live?.stop()
             vision.stop()
             session.stop()
+        }
+        // Push the latest segmentation mask into the renderer whenever
+        // VisionSession publishes a new frame. Cheap; the renderer just
+        // re-binds a CVMetalTexture pointer.
+        .onChange(of: vision.passCount) { _, _ in
+            session.renderer.submitMask(vision.latestFrame?.personMask)
+            // Make the latest pose/motion data visible to PromptComposer
+            // for the next diffusion pass.
+            benchmark.latestVisionFrame = vision.latestFrame
+        }
+        .onChange(of: styleStrength) { _, new in
+            session.renderer.styleStrength = new
+        }
+        .onChange(of: maskOnPerson) { _, new in
+            session.renderer.maskEnabled = new
         }
     }
 
@@ -95,6 +118,13 @@ struct ContentView: View {
                     Label("Vision", systemImage: "figure.stand")
                 }
                 .toggleStyle(.button)
+                .controlSize(.small)
+                Button {
+                    toggleFullscreen()
+                } label: {
+                    Label("Fullscreen", systemImage: "arrow.up.left.and.arrow.down.right")
+                }
+                .buttonStyle(.bordered)
                 .controlSize(.small)
             }
             .font(.caption2)
@@ -155,7 +185,8 @@ struct ContentView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
-                    TextField("prompt", text: $benchmark.prompt)
+                    presetPicker
+                    TextField("extra prompt (optional)", text: $benchmark.prompt)
                         .textFieldStyle(.roundedBorder)
                         .frame(minWidth: 320)
 
@@ -184,9 +215,71 @@ struct ContentView: View {
                         .disabled(benchmark.loadState != .loaded ||
                                   benchmark.runState == .running ||
                                   session.latestPixelBuffer == nil)
+                        Toggle(isOn: Binding(
+                            get: { liveOn },
+                            set: { newValue in
+                                liveOn = newValue
+                                if newValue {
+                                    live?.start(consuming: session, settings: benchmark)
+                                } else {
+                                    live?.stop()
+                                }
+                            }
+                        )) {
+                            Label("Live", systemImage: "sparkles.tv")
+                        }
+                        .toggleStyle(.button)
+                        .disabled(benchmark.loadState != .loaded)
                     }
 
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(String(format: "style: %.2f", styleStrength))
+                                .font(.caption)
+                            Slider(value: $styleStrength, in: 0...1)
+                                .frame(width: 160)
+                        }
+                        Toggle("mask on person", isOn: $maskOnPerson)
+                            .font(.caption)
+                            .toggleStyle(.checkbox)
+                        Toggle("pose modifier", isOn: Binding(
+                            get: { benchmark.composer.enablePoseModifier },
+                            set: { benchmark.composer.enablePoseModifier = $0 }
+                        ))
+                            .font(.caption)
+                            .toggleStyle(.checkbox)
+                        Toggle("motion modifier", isOn: Binding(
+                            get: { benchmark.composer.enableMotionModifier },
+                            set: { benchmark.composer.enableMotionModifier = $0 }
+                        ))
+                            .font(.caption)
+                            .toggleStyle(.checkbox)
+                    }
+
+                    HStack(spacing: 12) {
+                        Picker("resolution", selection: $benchmark.variant) {
+                            ForEach(ModelVariant.allCases) { v in
+                                Text(v.label).tag(v)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                        .disabled(liveOn || benchmark.loadState == .loading)
+
+                        Picker("compute", selection: $benchmark.computeUnits) {
+                            ForEach(ComputeUnitChoice.allCases) { c in
+                                Text(c.label).tag(c)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                        .disabled(liveOn || benchmark.loadState == .loading)
+                    }
+                    .font(.caption)
+
                     benchmarkStatusText
+                    liveStatusText
+                    effectivePromptText
                 }
             }
         }
@@ -251,6 +344,99 @@ struct ContentView: View {
                 .foregroundStyle(.orange)
                 .lineLimit(3)
         }
+    }
+
+    @ViewBuilder
+    private var liveStatusText: some View {
+        if let live, liveOn {
+            let ms = live.smoothedSeconds * 1000.0
+            let fps = live.smoothedSeconds > 0 ? 1.0 / live.smoothedSeconds : 0
+            let line: String = {
+                switch live.status {
+                case .idle: return "live: idle"
+                case .waitingForModel: return "live: model not loaded"
+                case .running:
+                    return String(format: "live: %.0f ms / pass (%.2f Hz) · %d passes",
+                                  ms, fps, live.passCount)
+                case .stalled(let r): return "live: stalled (\(r))"
+                case .failed(let m): return "live: error \(m)"
+                }
+            }()
+            Text(line)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.cyan)
+        }
+    }
+
+    // MARK: - PromptKit (M4)
+
+    @ViewBuilder
+    private var presetPicker: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(StylePresets.all) { preset in
+                    let selected = benchmark.composer.preset.id == preset.id
+                    Button {
+                        benchmark.composer.preset = preset
+                        benchmark.stepCount = preset.suggestedSteps
+                        benchmark.strength = preset.suggestedStrength
+                    } label: {
+                        Label(preset.name, systemImage: preset.symbol)
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(selected ? Color.accentColor.opacity(0.6)
+                                           : Color.white.opacity(0.08))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(selected ? Color.accentColor : .clear,
+                                    lineWidth: 1)
+                    )
+                }
+            }
+        }
+        .frame(maxHeight: 32)
+    }
+
+    @ViewBuilder
+    private var effectivePromptText: some View {
+        // Trigger SwiftUI to recompute on any of the inputs the composer uses.
+        let _ = vision.passCount
+        let _ = benchmark.composer.preset.id
+        let _ = benchmark.composer.enablePoseModifier
+        let _ = benchmark.composer.enableMotionModifier
+        let comp = benchmark.composer.compose(with: benchmark.latestVisionFrame)
+        VStack(alignment: .leading, spacing: 2) {
+            Text("→ \(comp.prompt)")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.85))
+                .lineLimit(2)
+                .truncationMode(.tail)
+            HStack(spacing: 8) {
+                if let p = comp.poseHint {
+                    Label(p, systemImage: "figure.wave")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                }
+                if let m = comp.motionHint {
+                    Label(m, systemImage: "wind")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private func toggleFullscreen() {
+        guard let window = NSApplication.shared.keyWindow
+              ?? NSApplication.shared.windows.first
+        else { return }
+        window.toggleFullScreen(nil)
     }
 }
 
