@@ -50,7 +50,11 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     /// Public composite knobs. Read on the main thread (draw callback).
     public var compositeEnabled: Bool = false
     public var styleStrength: Float = 1.0
-    public var maskEnabled: Bool = true
+    /// Where the AI layer is applied. Default `.background` so a
+    /// "starry night" prompt repaints the room around the person while
+    /// the person stays recognisable as themselves (still subtly
+    /// shaded by `styleStrength` on top of camera).
+    public var maskMode: MaskMode = .background
     public var maskSoftness: Float = 1.0
 
     public private(set) var drawnFrames: Int = 0
@@ -237,7 +241,9 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             var uniforms = CompositeUniforms(
                 blend_t: t,
                 style_strength: styleStrength,
-                mask_enabled: (maskEnabled && personMaskTexture != nil) ? 1.0 : 0.0,
+                mask_mode: (maskMode == .full || personMaskTexture == nil)
+                    ? 0.0
+                    : (maskMode == .person ? 1.0 : 2.0),
                 mask_softness: maskSoftness
             )
 
@@ -277,8 +283,24 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
 private struct CompositeUniforms {
     var blend_t: Float
     var style_strength: Float
-    var mask_enabled: Float
+    var mask_mode: Float
     var mask_softness: Float
+}
+
+/// Where the stylized layer is applied relative to the person mask.
+public enum MaskMode: String, CaseIterable, Identifiable, Sendable {
+    case full         // No mask: stylize the whole frame.
+    case person       // Stylize the person only; background stays as camera.
+    case background   // Stylize the background only; person stays as camera.
+
+    public var id: String { rawValue }
+    public var label: String {
+        switch self {
+        case .full:       return "Full frame"
+        case .person:     return "Person"
+        case .background: return "Background"
+        }
+    }
 }
 
 public enum RendererError: Error, LocalizedError {

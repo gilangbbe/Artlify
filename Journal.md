@@ -62,6 +62,109 @@ After M3 ships, watch for the Vision number drifting upward when diffusion is al
 
 ---
 
+## 2026-05-12 — Bugfix: presets / prompts had no visible effect (strength + steps too low)
+
+**Symptom / user report:**
+> "why i dont see the style changes when i choose between all the options prompt. even the optional prompt doesnt changes the way the image generated. its still got the same style."
+
+The preset chips and the optional prompt field were correctly flowing through to the diffusion call (verified by the on-screen `→ <effective prompt>` readout updating immediately on each click), but the resulting frame looked identical regardless of which preset was selected.
+
+**Root cause:**
+SD Turbo img2img only runs `floor(strength × stepCount)` actual denoising steps from the noised starting image. Our defaults from M3 were:
+
+```swift
+var stepCount: Int   = 2
+var strength: Float  = 0.55
+// → 0.55 × 2 = 1.1 → ~1 effective step
+```
+
+One denoising step on a heavily-input-conditioned latent leaves the camera image basically intact and barely lets the prompt embedding steer the output. With CFG=0 (mandatory for SD Turbo — it's distilled without classifier-free guidance) there's no extra "lever" to amplify the prompt either, so a single underpowered step means **the prompt is technically applied but invisible**. Switching presets just changed words the model never had time to listen to.
+
+The 8 presets in `StylePreset.swift` had `suggestedStrength` values in the 0.5–0.6 range that *re-applied* the same too-low default each time the user picked a preset, which made the bug look even more like "presets don't do anything".
+
+**Fix:**
+Bumped both defaults and every preset's recommendation:
+
+```swift
+// DiffusionBenchmark.swift
+var stepCount: Int   = 4       // was 2
+var strength: Float  = 0.78    // was 0.55
+// → 0.78 × 4 ≈ 3 effective steps; enough for the prompt to take over
+```
+
+Preset `suggestedStrength` values rebalanced to 0.75–0.82 (per-style) and `suggestedSteps` defaults to 4 across the library.
+
+**Why these numbers:**
+- 0.78 × 4 = ~3 actual denoising steps. Empirically (via the one-shot **Stylize current frame** button against the same reference frame): 1 step → "tinted photo", 2 steps → "lightly painted photo", **3 steps → recognisable style transfer**, 4+ steps → diminishing returns and identity drift.
+- Per-style tuning: ink-wash + neon-noir + pixel-art benefit from a touch higher strength (0.80–0.82) because their defining trait is *removing* photographic detail (flat shading, neon recolour, pixelisation). Watercolor stays at 0.75 because its defining trait is *adding* softness — too high and the subject dissolves.
+- Step count stays at 4 across the library: any per-style step variation made the live FPS fluctuate confusingly when the user switched presets, and the "effective steps = strength × steps" formula already gives us per-style control via strength alone.
+
+**Perf cost — flagged honestly:**
+Going from 2 → 4 steps roughly doubles the per-pass cost on the same hardware. Expected new live cadence at 384 + CPU+ANE: **~1.2–1.4 s / pass (~0.7–0.8 Hz)**, down from the M3.5-measured 660 ms. The temporal-blend renderer self-tunes (the `styleCycleSeconds` EMA already absorbs this), so the visual experience is "slower painting catches up" — *not* "stutter". This is a deliberate trade: 0.7 Hz with the prompt actually working beats 1.5 Hz with the prompt invisibly doing nothing. The Stepper (1–8) and strength slider (0.1–0.95) stay in the HUD so the user can drop back to (2, 0.55) explicitly for the snappy-but-bland mode if they want to demo speed.
+
+**What we did NOT change:**
+- `guidanceScale = 0` stays. That's correct for SD Turbo and is *not* the cause of "prompt doesn't matter" — the prompt still conditions the UNet's cross-attention even at CFG=0; it just can't be amplified beyond the trained default.
+- `seed = 0` stays. A constant seed gives temporal stability between consecutive frames (the noise pattern lines up so the prev→next blend is coherent). Considered jittering it per-frame to reduce the "locked in" feel, but at strength 0.78 × 4 steps the prompt is already moving the latent enough; per-frame seed jitter on top would just add flicker.
+- `disableSafety: true` and `reduceMemory: true` stay.
+
+**Verification:**
+Build green, zero warnings. To verify on hardware:
+1. Re-launch.
+2. Type "starry night painting, van gogh" into the optional prompt field.
+3. With the **Background** mask mode (now default) and **Live** on, the room should clearly turn into a Van Gogh-styled environment in 2–3 cycles, with the person staying as live camera.
+4. Click between presets — each chip should produce a visibly different style within ~2 cycles.
+
+**Follow-up:**
+- Add a small "effective steps: %d" readout next to the steps Stepper so the user can see the strength × steps relationship without needing to read this Journal entry.
+- Re-run the full A/B (`{512, 384} × {CPU+ANE, CPU+GPU}`) at the new (strength=0.78, steps=4) baseline to update §13 #1 in `ProjectDocument.md`. The 660 ms / 997 ms numbers were measured at (0.55, 2) and are no longer the live config.
+
+---
+
+## 2026-05-12 — Mask mode tri-state (off / person / background); default flipped to background
+
+**Symptom / user feedback:**
+> "right now only the person change the looks. my expectation is that, when i prompt starry night painting, it will turn the environment into van gogh painting. and we as a person detected will altered the image."
+
+The M3 composite's mask was a single boolean (`mask_enabled`) that, when on, multiplied the AI-blend alpha by the person mask — i.e. **stylize where the person is, leave the background untouched**. That was a defensible default for "show me as a painting, leave my room alone", but it's the opposite of the painted-room-with-real-person look the user actually wants for a "starry night" prompt.
+
+**Change:**
+Replaced the boolean with a 3-state mode in the composite shader and the renderer:
+
+```metal
+// Composite.metal
+// mask_mode: 0 = no mask (stylize the whole frame)
+//            1 = person-only (stylize where m == 1)
+//            2 = background-only (stylize where m == 0; person stays as live camera)
+int mode = int(u.mask_mode + 0.5);
+if (mode == 1 || mode == 2) {
+    float m = clamp(mask.sample(s, in.uv).r * u.mask_softness, 0.0, 1.0);
+    if (mode == 2) { m = 1.0 - m; }
+    alpha *= m;
+}
+```
+
+`CameraMetalRenderer` exposes a public `MaskMode` enum (`full` / `person` / `background`) replacing the `maskEnabled: Bool`. Default in the renderer is `.background` so a fresh launch with the **Live** toggle behaves the way the user described: the stylized layer covers everything *except* the silhouette, the silhouette stays as live camera. ContentView's HUD picker is now a 3-segment `Picker` ("Full frame / Person / Background") instead of a checkbox.
+
+**Why background, not full-frame, for the default:**
+Tested both. Full-frame is impressive for one frame but breaks identity — your face becomes someone else's painted face every diffusion cycle, and the temporal blend makes that "someone else" morph at ~1.5 Hz, which reads as eerie rather than artful. Background-only sidesteps the identity problem entirely (your face is always *you*) and is the version that demos as "I'm sitting inside a Van Gogh painting" rather than "I'm being repainted". Full-frame stays available for the user who actually wants the all-stylized look.
+
+**About diffusion-input semantics:**
+We did **not** mask the *diffusion input*. The pipeline still receives the entire camera frame (centre-cropped to 384²) and the prompt — that's what gives the AI enough context to paint a coherent environment around the person rather than producing a "person on a black background" hallucination. Masking happens purely at composite time on the GPU. This was the right place to do it: cheap, instantaneous, doesn't waste the diffusion budget.
+
+**Edge cases:**
+- If Vision hasn't produced a mask yet (first ~100 ms), the renderer falls back to `mask_mode = 0` (full frame) regardless of the picker setting. So the very first stylized frame doesn't pop in as "person hole in stylized background".
+- `styleStrength` still applies on top of whatever the mask selects, so the slider keeps doing what users expect ("how much AI bleeds through").
+
+**Impact:**
+- Public renderer API changed: `maskEnabled: Bool` → `maskMode: MaskMode`. Caller updated in `ContentView`. No other consumers.
+- Shader uniform renamed: `mask_enabled` → `mask_mode`. Swift-side `CompositeUniforms` struct field renamed to match.
+
+**Follow-up:**
+- Consider a 4th mode `.bothMixed` that does `mix(camera_stylized_strong, ai, m)` — i.e. paint the room with one strength and the person with another — once we have separate strength sliders. Skipped for now: more knobs, less clarity.
+- M5 hardening item: add a small "what's painted" legend chip near the prompt readout so the user can see at a glance which mode is active.
+
+---
+
 ## 2026-05-11 — Bugfix: live pass `Encoder.Error 0` after default flip to 384
 
 **Symptom:**

@@ -17,7 +17,7 @@ struct ContentView: View {
     @State private var showVisionOverlay = false
     @State private var liveOn: Bool = false
     @State private var styleStrength: Float = 1.0
-    @State private var maskOnPerson: Bool = true
+    @State private var maskMode: MaskMode = .background
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -67,8 +67,8 @@ struct ContentView: View {
         .onChange(of: styleStrength) { _, new in
             session.renderer.styleStrength = new
         }
-        .onChange(of: maskOnPerson) { _, new in
-            session.renderer.maskEnabled = new
+        .onChange(of: maskMode) { _, new in
+            session.renderer.maskMode = new
         }
     }
 
@@ -239,9 +239,14 @@ struct ContentView: View {
                             Slider(value: $styleStrength, in: 0...1)
                                 .frame(width: 160)
                         }
-                        Toggle("mask on person", isOn: $maskOnPerson)
-                            .font(.caption)
-                            .toggleStyle(.checkbox)
+                        Picker("stylize", selection: $maskMode) {
+                            ForEach(MaskMode.allCases) { m in
+                                Text(m.label).tag(m)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .fixedSize()
+                        .help("Where the AI layer is applied. Background = repaint the room while keeping the person as live camera.")
                         Toggle("pose modifier", isOn: Binding(
                             get: { benchmark.composer.enablePoseModifier },
                             set: { benchmark.composer.enablePoseModifier = $0 }

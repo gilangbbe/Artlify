@@ -13,7 +13,12 @@
 //    texture(2) — aiNext (stylized texture currently fading in, RGBA)
 //    texture(3) — mask   (single-channel, R8, person alpha; optional)
 //    buffer(0)  — CompositeUniforms { blend_t, style_strength,
-//                                     mask_enabled, mask_softness }
+//                                     mask_mode, mask_softness }
+//
+//  mask_mode: 0 = no mask (stylize the whole frame)
+//             1 = person-only (stylize where mask == 1)
+//             2 = background-only (stylize where mask == 0; person
+//                 stays as live camera)
 //
 
 #include <metal_stdlib>
@@ -27,7 +32,7 @@ struct VSOut {
 struct CompositeUniforms {
     float blend_t;        // 0 = fully aiPrev, 1 = fully aiNext
     float style_strength; // 0 = pure camera, 1 = full AI
-    float mask_enabled;   // 0 or 1
+    float mask_mode;      // 0 = full frame (no mask), 1 = person-only, 2 = background-only
     float mask_softness;  // multiplier on mask alpha (0..1+ to bias)
 };
 
@@ -48,8 +53,14 @@ fragment float4 composite_fragment(
     float4 ai   = mix(prev, next, clamp(u.blend_t, 0.0, 1.0));
 
     float alpha = clamp(u.style_strength, 0.0, 1.0);
-    if (u.mask_enabled > 0.5) {
+
+    // mask_mode: 0 = no mask (style applies everywhere)
+    //            1 = person-only (style where m == 1)
+    //            2 = background-only (style where m == 0)
+    int mode = int(u.mask_mode + 0.5);
+    if (mode == 1 || mode == 2) {
         float m = clamp(mask.sample(s, in.uv).r * u.mask_softness, 0.0, 1.0);
+        if (mode == 2) { m = 1.0 - m; }
         alpha *= m;
     }
 

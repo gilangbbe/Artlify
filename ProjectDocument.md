@@ -173,10 +173,10 @@ Because diffusion produces ~5 FPS but we display 60 FPS, the renderer must hide 
 
 1. Renderer holds two textures: `aiPrev` and `aiNext` (latest two diffusion outputs).
 2. Each vsync, it computes `t = clamp((now - aiNextTimestamp) / expectedInterval, 0, 1)` and lerps.
-3. The live camera silhouette (from the Vision mask) is composited **on top** at 30 FPS, so the user sees their own motion immediately while the AI styling "catches up" softly.
+3. The composite shader applies a **mask mode** that decides where the AI layer is allowed to bleed through (`MaskMode`: `.full` / `.person` / `.background`). Default is `.background` so a "starry night" prompt repaints the room while the live camera silhouette stays as the actual person — they see their own motion immediately while the painted environment "catches up" softly. `.person` is the inverse (stylize the silhouette, leave the room alone) and `.full` skips the mask entirely.
 4. Optional (v1.1): a shader-driven warp uses pose-joint deltas to distort `aiNext` between diffusion updates — a cheap optical-flow approximation.
 
-This is the difference between "feels broken at 5 FPS" and "feels like a living painting."
+This is the difference between "feels broken at 5 FPS" and "feels like a living painting." Note that masking happens **only at composite time** — the diffusion pipeline always sees the full camera frame so it has enough context to paint a coherent environment around the person.
 
 ---
 
@@ -262,7 +262,7 @@ Models are **downloaded on first launch** from Hugging Face into `~/Library/Appl
 
 Stated explicitly so we can revisit:
 
-1. ~~**Assumption:** SD Turbo at 512×512, 2 steps, fp16, achieves ≥3 FPS on M5 base. *To be benchmarked in M1.*~~ **Measured (2026-05-11):** 512×512 + `.cpuAndNeuralEngine` = **~997 ms / pass (~1.0 FPS)**; 384×384 + `.cpuAndNeuralEngine` = **~660 ms / pass (~1.5 FPS)** — adopted as default in M4. All measurements with `disableSafety`, `reduceMemory`, `guidanceScale=0`, dpm-solver, fp16. Still below the original ≥3 FPS target. Implication: M3 / M4 run on the assumption that the stylized layer updates at ~1.5 Hz while the passthrough draws at 60 Hz; temporal blend (§7) is load-bearing, not optional, and the renderer's cycle EMA self-tunes to whatever the diffusion cadence ends up being. Remaining optimisations parked for M5+: split UNet/VAE across compute units, optional 256×256 mode, ControlNet-free guidance experiments.
+1. ~~**Assumption:** SD Turbo at 512×512, 2 steps, fp16, achieves ≥3 FPS on M5 base. *To be benchmarked in M1.*~~ **Measured (2026-05-11):** 512×512 + `.cpuAndNeuralEngine` = **~997 ms / pass (~1.0 FPS)**; 384×384 + `.cpuAndNeuralEngine` = **~660 ms / pass (~1.5 FPS)** — adopted as default in M4. All measurements with `disableSafety`, `reduceMemory`, `guidanceScale=0`, dpm-solver, fp16. **Updated (2026-05-12):** the (steps=2, strength=0.55) configuration these numbers were measured at produces ~1 effective denoising step, which made the prompt invisibly weak; live defaults are now `(steps=4, strength=0.78)`, expected ~1.2–1.4 s / pass at 384/ANE (re-measurement pending). Implication unchanged: temporal blend (§7) is load-bearing — the renderer's cycle EMA self-tunes to whatever cadence the diffusion settles at. Remaining optimisations parked for M5+: split UNet/VAE across compute units, optional 256×256 mode, ControlNet-free guidance experiments.
 2. **Assumption:** Continuity Camera latency is acceptable (<150 ms end-to-end). *To be measured in M0.*
 3. **Assumption:** A single foreground person is the dominant use case; multi-person is a v2 concern.
 4. **Open:** Do we want a "kiosk mode" (auto-fullscreen, no UI) for installations? Defer until after v1 demo.

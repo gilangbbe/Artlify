@@ -97,8 +97,8 @@ final class DiffusionBenchmark {
 
     // ---- User-tunable inputs (read by both the benchmark button and the live loop)
     var prompt: String = ""
-    var stepCount: Int = 2
-    var strength: Float = 0.55
+    var stepCount: Int = 4
+    var strength: Float = 0.78
 
     var computeUnits: ComputeUnitChoice = .ane {
         didSet { if oldValue != computeUnits { invalidatePipeline() } }
