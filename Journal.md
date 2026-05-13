@@ -15,6 +15,44 @@ Entry template:
 
 ---
 
+## 2026-05-13 — `particles` branch: shockwave breaks the silhouette + negative-camera flash boxes
+
+**Decision / change:**
+Two more installation-aesthetic moves on top of the trails + audio reactivity from earlier today.
+
+**1. Shockwaves now break OUT of the body.** Previously the audio-transient kick was applied as a force inside the shader, but the mask-gate in the fragment shader killed alpha the moment a particle crossed the silhouette boundary — so visually the burst stayed contained inside the body shape. Three coordinated changes fix that:
+  - New `bodyCenter: float2` uniform on `ParticleUniforms` (Metal + Swift). The shockwave origin is now `bodyCenter + (0.12*pan, 0)` instead of a hard-coded `(0.5+0.4*pan, 0.5)`, so the wave radiates from inside the actual person, not screen middle.
+  - Kick magnitude bumped 6.0 → 9.0, falloff softened (`1/(1+5d²)` was `1/(1+12d²)`) so the impulse still has real force at the silhouette edge.
+  - In `particle_fragment`, an `escapeBoost = saturate(strength * (0.6*transient + 0.25*level) * 2.0)` lerps `gate` toward 1.0 during transients. So the moment a clap or beat fires, the gate opens, the kick has already shoved particles outward, and they remain visible streaming past the body boundary. Combined with the trail accumulator, this leaves a luminous wake of particles bursting outward through the silhouette.
+  - `bodyCenter` is computed in `ContentView.bodyCenter(from:joints:)`: average of any `id` containing "hip", fallback to all confident joints, fallback to `(0.5, 0.5)`. Fed into `field.bodyCenter` on every Vision pass.
+
+**2. Negative-camera flash boxes.** New render layer: random rectangles flash on around body joints, and inside each rectangle the live camera feed is shown with its colour negated (RGB inverted), then alpha-blended over the dark canvas. The dark gallery is intermittently "punctured" by stuttering X-ray-like cutouts wherever the body parts briefly are. New artefacts:
+  - `RenderKit/NegativeBoxes.metal` — `negative_boxes_fragment` reads the latest camera texture and a `constant NegBox*` array (cx, cy, hw, hh + alpha), discards outside all boxes, samples camera and inverts inside, with a 15%-of-half-extent smoothstep edge so cutouts don't have a hard rectangular line.
+  - `CameraMetalRenderer`: new `negativeBoxesPipeline` (standard alpha blend), persistent `negativeBoxesBuffer` sized for `MAX_NEG_BOXES = 16`, `[NegativeBoxState]` CPU list with birth/duration/peak. `flashNegativeBox(center:halfSize:duration:peak:)` is the public API. Each draw, `packNegativeBoxes(now:)` culls expired entries and converts live ones into `GPUNegBox` packed records with a triangular envelope (`alpha = peak * (1 - |2t-1|)`). The box pass is encoded after the trail-present pass (so flashes overlay everything cleanly and aren't subject to trail decay) and also after the no-trails camera/particles path.
+  - `ContentView`: a `Timer.publish(every: 0.11, on: .main, in: .common).autoconnect()` (~9 Hz, intentionally slow so flashes feel stuttery and intentional rather than continuous noise) drives `tickNegativeBoxes()`, which picks 1–3 random joints with confidence ≥ 0.4, generates random box sizes in [0.025, 0.07] uv half-extent each axis (decoupled, so boxes vary square-to-strip), random duration 0.18–0.55 s.
+  - HUD gained a row: "neg boxes" toggle + intensity slider 0.10–1.00 (peak alpha).
+
+**Reason:**
+For (1): the user explicitly asked the shockwave to "break the segmentation outward" because the body-confined version felt too tame — the audio kicked the particles but the silhouette still owned the shape, so the visual didn't carry the audio's energy out into the room. With the shockwave breaking out, a clap reads as the body literally exploding into stardust for a beat, then re-coalescing as the trail fades. That's the gallery-scale moment the previous iteration was missing.
+
+For (2): the dark-background swarm aesthetic is contemplative but visually static. Random negative-camera windows reintroduce the live camera feed, but only as **inverted glimpses** — you see the room in fragments, in the wrong colours, only where the body is. It reads like a glitchy security feed leaking through a black canvas. Together with the swarm and trails, the installation now layers (a) silhouette as glowing cloud, (b) audio-reactive bursts from inside the body, (c) the real world bleeding through in negative at the joints. That's three different ways the body is rendered at once.
+
+**Impact:**
+- Per-frame cost of the boxes pass is one full-screen triangle with a 16-iter loop in the fragment that early-outs on the first bounding-box test — so for any pixel not under any box, it does ~16 vec2 abs+compare and exits. Negligible.
+- Negative-boxes pass needs the live camera texture, which the renderer was already submitting via `submit(_:)` even in dark/trail mode. So no plumbing changes needed for the camera path.
+- The boxes draw on top of the trail accumulator output, NOT into the accumulator. This was deliberate: if the boxes went through trails they'd smear into rectangular ghost trails, which would look more like glitch art than the intended sharp X-ray flashes.
+- Body-center anchor only updates at Vision rate (~15 Hz) — fine for shockwave origin since transients are visually slow. No interpolation needed.
+- Vision joint `id` strings vary slightly across OS versions (e.g. `right_shoulder_1_joint` vs `right_shoulder_joint`), so the hip lookup uses substring contains rather than exact match. Falls through to whole-body centroid then to screen center if no hips visible — robust to back-turned poses.
+- `Combine` had to be imported in `ContentView` for `Timer.publish().autoconnect()` (Swift 6 strictness; transitively-imported wasn't enough).
+
+**Follow-up:**
+- Try driving negative-box trigger off the audio transient instead of (or in addition to) the steady timer — a snare hit would simultaneously fire the shockwave AND a burst of body-part flashes.
+- Vary the box "colour transform" beyond pure invert: hue rotate, channel swap, or bandpass per box for more visual variety.
+- The intensity slider could split into peak and rate (Hz) so silent vs. busy modes differ.
+- Optional shockwave-on-keypress for testing without a noisy room.
+
+---
+
 ## 2026-05-13 — `particles` branch: motion trails + audio reactivity
 
 **Decision / change:**

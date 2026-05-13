@@ -16,6 +16,7 @@
 
 import SwiftUI
 import AppKit
+import Combine
 
 struct ContentView: View {
     @State private var session = CameraSession()
@@ -24,6 +25,10 @@ struct ContentView: View {
     @State private var audio = AudioReactor()
     @State private var showVisionOverlay = false
     @State private var showHUD = true
+    /// Drives the random negative-camera flashes around body parts.
+    /// Tick rate is intentionally slow (~9 Hz) so flashes feel
+    /// stuttery and intentional rather than continuous noise.
+    @State private var boxTimer = Timer.publish(every: 0.11, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -81,6 +86,16 @@ struct ContentView: View {
         // shader reads it as a force-field source.
         .onChange(of: vision.passCount) { _, _ in
             session.renderer.submitMask(vision.latestFrame?.personMask)
+            // Update body anchor so audio shockwaves radiate from
+            // inside the actual body, not screen center.
+            if let f = vision.latestFrame, let field {
+                field.bodyCenter = bodyCenter(from: f.joints)
+            }
+        }
+        // Periodically flash 1–3 negative-camera boxes around random
+        // body joints. Empty frames (no joints) are silently skipped.
+        .onReceive(boxTimer) { _ in
+            tickNegativeBoxes()
         }
         // Keyboard: H toggles the HUD for clean recordings.
         .background(KeyHandler { key in
@@ -263,6 +278,26 @@ struct ContentView: View {
                 Spacer()
             }
 
+            HStack(spacing: 12) {
+                Toggle("neg boxes", isOn: Binding(
+                    get: { session.renderer.negativeBoxesEnabled },
+                    set: { session.renderer.negativeBoxesEnabled = $0 }
+                ))
+                .toggleStyle(.button)
+                .controlSize(.small)
+                Text("intensity")
+                    .font(.caption)
+                Slider(value: Binding(
+                    get: { session.renderer.negativeBoxesPeak },
+                    set: { session.renderer.negativeBoxesPeak = $0 }
+                ), in: 0.1...1.0)
+                    .frame(width: 140)
+                Text(String(format: "%.2f", session.renderer.negativeBoxesPeak))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+
             audioRow(field: field)
 
             HStack(spacing: 12) {
@@ -361,6 +396,56 @@ struct ContentView: View {
             Text(label)
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Body anchor + negative-camera box flashes
+
+    /// Average of detected hip joints (Vision uv, top-left flipped),
+    /// falling back to the centroid of all confident joints, falling
+    /// back to screen center. Drives the audio-shockwave origin.
+    private func bodyCenter(from joints: [VisionJoint]) -> SIMD2<Float> {
+        let hips = joints.filter { $0.id.localizedCaseInsensitiveContains("hip") }
+        let pool = hips.isEmpty ? joints : hips
+        guard !pool.isEmpty else { return SIMD2<Float>(0.5, 0.5) }
+        var sx: CGFloat = 0
+        var sy: CGFloat = 0
+        for j in pool { sx += j.point.x; sy += j.point.y }
+        let n = CGFloat(pool.count)
+        // Vision y is bottom-left origin; uv is top-left → flip.
+        return SIMD2<Float>(Float(sx / n), Float(1.0 - sy / n))
+    }
+
+    /// One tick of the negative-camera flash driver. Picks a random
+    /// subset (1–3) of confident joints and tells the renderer to flash
+    /// a box at each, with a random aspect-ratio sized roughly to the
+    /// expected limb extent. Off-frame joints are skipped.
+    private func tickNegativeBoxes() {
+        guard session.renderer.negativeBoxesEnabled,
+              let f = vision.latestFrame
+        else { return }
+        let candidates = f.joints.filter { $0.confidence >= 0.4 }
+        guard !candidates.isEmpty else { return }
+        let pickN = Int.random(in: 1...min(3, candidates.count))
+        var picked: Set<Int> = []
+        while picked.count < pickN {
+            picked.insert(Int.random(in: 0..<candidates.count))
+        }
+        for idx in picked {
+            let j = candidates[idx]
+            // Vision y → uv y flip.
+            let cx = Float(j.point.x)
+            let cy = Float(1.0 - j.point.y)
+            // Random rectangle: 5–14% wide, 5–14% tall, decoupled so
+            // boxes vary from squares to long strips.
+            let hw = Float.random(in: 0.025...0.07)
+            let hh = Float.random(in: 0.025...0.07)
+            let dur = Double.random(in: 0.18...0.55)
+            session.renderer.flashNegativeBox(
+                center: SIMD2<Float>(cx, cy),
+                halfSize: SIMD2<Float>(hw, hh),
+                duration: dur
+            )
         }
     }
 

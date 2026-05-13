@@ -52,6 +52,7 @@ struct ParticleUniforms {
     var audioPan:      Float
     var audioTransient:Float
     var audioStrength: Float
+    var bodyCenter:    SIMD2<Float>
 }
 
 @MainActor
@@ -85,6 +86,11 @@ public final class ParticleField {
     public var audioReactor: AudioReactor?
     /// 0 = ignore audio, 1 = full modulation.
     public var audioStrength: Float = 0.0
+
+    /// Anchor point in uv space (0..1, top-left origin) used as the
+    /// origin of audio-transient shockwaves. Set from ContentView each
+    /// time Vision publishes a fresh pose; falls back to screen center.
+    public var bodyCenter: SIMD2<Float> = SIMD2<Float>(0.5, 0.5)
 
     /// Number of live particles. Changing this rebuilds the buffer.
     public var count: Int = 30_000 {
@@ -218,7 +224,8 @@ public final class ParticleField {
             audioHigh:     audio.high,
             audioPan:      audio.pan,
             audioTransient:audio.transient,
-            audioStrength: audioStrength
+            audioStrength: audioStrength,
+            bodyCenter:    bodyCenter
         )
 
         enc.setComputePipelineState(computePipeline)
@@ -266,7 +273,8 @@ public final class ParticleField {
             audioHigh:     audio.high,
             audioPan:      audio.pan,
             audioTransient:audio.transient,
-            audioStrength: audioStrength
+            audioStrength: audioStrength,
+            bodyCenter:    bodyCenter
         )
 
         encoder.setRenderPipelineState(renderPipeline)

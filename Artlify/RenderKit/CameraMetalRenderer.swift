@@ -33,6 +33,7 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     private let passthroughPipeline: MTLRenderPipelineState
     private let compositePipeline: MTLRenderPipelineState
     private let trailDecayPipeline: MTLRenderPipelineState
+    private let negativeBoxesPipeline: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
 
     // Trail (feedback) accumulator. Two textures, ping-ponged each
@@ -84,6 +85,16 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     /// fluid trails; 0.97 = long ribbons; 1.0 = forever (don't).
     public var trailDecay: Float = 0.93
 
+    /// Random negative-camera windows that flash around body joints.
+    /// Off by default; switch on from the HUD.
+    public var negativeBoxesEnabled: Bool = true
+    /// Per-flash peak alpha when ContentView calls `flashNegativeBox`.
+    /// Stored here so the HUD slider can tune intensity globally.
+    public var negativeBoxesPeak: Float = 0.85
+    private var negativeBoxes: [NegativeBoxState] = []
+    private let negativeBoxesBuffer: MTLBuffer
+    private static let maxNegativeBoxes = 16
+
     public private(set) var drawnFrames: Int = 0
     public private(set) var droppedFrames: Int = 0
     private var lastFPSReport = CFAbsoluteTimeGetCurrent()
@@ -100,7 +111,8 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             let vfn = library.makeFunction(name: "passthrough_vertex"),
             let pfn = library.makeFunction(name: "passthrough_fragment"),
             let cfn = library.makeFunction(name: "composite_fragment"),
-            let tfn = library.makeFunction(name: "trail_decay_fragment")
+            let tfn = library.makeFunction(name: "trail_decay_fragment"),
+            let nfn = library.makeFunction(name: "negative_boxes_fragment")
         else {
             throw RendererError.shaderNotFound
         }
@@ -123,6 +135,29 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         tdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
         // No blending — trail-decay overwrites the destination.
         self.trailDecayPipeline = try device.makeRenderPipelineState(descriptor: tdesc)
+
+        // Negative boxes pass: standard alpha blend over the drawable.
+        let ndesc = MTLRenderPipelineDescriptor()
+        ndesc.vertexFunction = vfn
+        ndesc.fragmentFunction = nfn
+        ndesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        if let nca = ndesc.colorAttachments[0] {
+            nca.isBlendingEnabled = true
+            nca.rgbBlendOperation = .add
+            nca.alphaBlendOperation = .add
+            nca.sourceRGBBlendFactor = .sourceAlpha
+            nca.sourceAlphaBlendFactor = .one
+            nca.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            nca.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
+        self.negativeBoxesPipeline = try device.makeRenderPipelineState(descriptor: ndesc)
+
+        // Persistent buffer for the box uniforms (32 bytes each).
+        let bytes = MemoryLayout<GPUNegBox>.stride * Self.maxNegativeBoxes
+        guard let nb = device.makeBuffer(length: bytes, options: .storageModeShared) else {
+            throw RendererError.textureCacheCreationFailed
+        }
+        self.negativeBoxesBuffer = nb
 
         var cache: CVMetalTextureCache?
         let status = CVMetalTextureCacheCreate(
@@ -214,6 +249,76 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         aiPrev = nil
         aiNext = nil
         lastStyleArrival = 0
+    }
+
+    // MARK: - Submit (negative-camera box flashes)
+
+    /// Trigger a single flashing negative-camera window centered at
+    /// `center` (uv, top-left origin) with `halfSize` extents (uv).
+    /// Alpha rises and falls over `duration` seconds, peaking at the
+    /// midpoint. Boxes silently drop after they expire; the renderer
+    /// caps live boxes at MAX_NEG_BOXES (oldest are evicted).
+    public func flashNegativeBox(center: SIMD2<Float>,
+                                 halfSize: SIMD2<Float>,
+                                 duration: TimeInterval = 0.45,
+                                 peak: Float? = nil) {
+        let now = CFAbsoluteTimeGetCurrent()
+        let p = peak ?? negativeBoxesPeak
+        let box = NegativeBoxState(center: center,
+                                   halfSize: halfSize,
+                                   birth: now,
+                                   duration: max(0.05, duration),
+                                   peak: max(0, min(1, p)))
+        negativeBoxes.append(box)
+        if negativeBoxes.count > Self.maxNegativeBoxes {
+            // Drop oldest first.
+            negativeBoxes.removeFirst(negativeBoxes.count - Self.maxNegativeBoxes)
+        }
+    }
+
+    public func clearNegativeBoxes() {
+        negativeBoxes.removeAll(keepingCapacity: true)
+    }
+
+    /// Cull expired boxes and pack the live ones into the GPU buffer.
+    /// Returns the count actually written.
+    private func packNegativeBoxes(now: CFAbsoluteTime) -> Int {
+        // Drop expired.
+        negativeBoxes.removeAll { (now - $0.birth) >= $0.duration }
+        let n = min(negativeBoxes.count, Self.maxNegativeBoxes)
+        guard n > 0 else { return 0 }
+        let ptr = negativeBoxesBuffer.contents()
+            .bindMemory(to: GPUNegBox.self, capacity: Self.maxNegativeBoxes)
+        for i in 0..<n {
+            let b = negativeBoxes[i]
+            // Triangular envelope: rises to `peak` at duration/2, falls back.
+            let t = Float((now - b.birth) / b.duration)
+            let env = 1.0 - abs(2.0 * t - 1.0)         // 0..1..0
+            let alpha = b.peak * max(0, min(1, env))
+            ptr[i] = GPUNegBox(
+                rect: SIMD4<Float>(b.center.x, b.center.y,
+                                   b.halfSize.x, b.halfSize.y),
+                props: SIMD4<Float>(alpha, 0, 0, 0)
+            )
+        }
+        return n
+    }
+
+    /// Encode the negative-boxes pass on top of an existing render
+    /// encoder targeting the drawable. No-op if disabled, no boxes,
+    /// or no camera texture is available.
+    private func encodeNegativeBoxes(_ enc: MTLRenderCommandEncoder,
+                                     count: Int) {
+        guard count > 0,
+              negativeBoxesEnabled,
+              let cam = latestCameraTexture
+        else { return }
+        enc.setRenderPipelineState(negativeBoxesPipeline)
+        enc.setFragmentTexture(cam, index: 0)
+        enc.setFragmentBuffer(negativeBoxesBuffer, offset: 0, index: 1)
+        var c = Int32(count)
+        enc.setFragmentBytes(&c, length: MemoryLayout<Int32>.size, index: 2)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
     }
 
     private func makeTexture(from cgImage: CGImage) -> MTLTexture? {
@@ -339,6 +444,9 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
                 enc.setRenderPipelineState(passthroughPipeline)
                 enc.setFragmentTexture(next, index: 0)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                // Pass D (same encoder): negative-camera boxes flash on top.
+                let nbCount = packNegativeBoxes(now: CFAbsoluteTimeGetCurrent())
+                encodeNegativeBoxes(enc, count: nbCount)
                 enc.endEncoding()
             }
             drawnFrames += 1
@@ -399,6 +507,10 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             field.encodeRender(encoder: enc, mask: personMaskTexture, viewport: viewport)
         }
 
+        // Step 3: negative-camera boxes flash on top of everything else.
+        let nbCount = packNegativeBoxes(now: CFAbsoluteTimeGetCurrent())
+        encodeNegativeBoxes(enc, count: nbCount)
+
         reportFPSIfNeeded()
 
         enc.endEncoding()
@@ -421,6 +533,23 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
 /// Must match the layout of the Metal `TrailUniforms` struct in Trail.metal.
 private struct TrailUniforms {
     var decay: Float
+}
+
+/// Live negative-camera flash. Stored CPU-side; converted to a packed
+/// `GPUNegBox` each draw via `packNegativeBoxes(now:)`.
+private struct NegativeBoxState {
+    var center:   SIMD2<Float>
+    var halfSize: SIMD2<Float>
+    var birth:    CFAbsoluteTime
+    var duration: CFAbsoluteTime
+    var peak:     Float
+}
+
+/// Must match the layout of the Metal `NegBox` struct in NegativeBoxes.metal.
+/// 32 bytes, 16-byte aligned.
+private struct GPUNegBox {
+    var rect:  SIMD4<Float>   // cx, cy, hw, hh
+    var props: SIMD4<Float>   // alpha, _, _, _
 }
 
 /// Must match the layout of the Metal `CompositeUniforms` struct.

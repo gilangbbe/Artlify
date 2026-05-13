@@ -64,6 +64,12 @@ struct ParticleUniforms {
     float audioPan;      // -1..+1, stereo balance
     float audioTransient;// instantaneous attack pulse
     float audioStrength; // 0 = audio ignored, 1 = full modulation
+
+    // Body anchor in uv space (0..1, top-left origin). Shockwave
+    // origin is centered here so transients radiate from inside the
+    // silhouette outward, breaking the swarm out past the body edge.
+    // Defaults to (0.5, 0.5) when no pose is available.
+    float2 bodyCenter;
 };
 
 // Cheap deterministic noise — one float in, two floats out, in -1..1.
@@ -149,16 +155,22 @@ kernel void update_particles(
     float2 fFlow  = curlNoise(cseed) * (u.flow * audioFlowMul);
 
     // Transient shockwave: when a loud sudden sound hits, particles
-    // get an outward radial shove from a point on screen offset by
-    // the stereo pan. Decays the same frame because audioTransient
-    // itself decays in the AudioReactor; here it just flashes a force.
-    float2 src = float2(0.5 + 0.4 * u.audioPan, 0.5);
+    // get an outward radial shove from inside the body (bodyCenter,
+    // nudged by stereo pan so left-channel hits push from the left of
+    // the torso). The kick is strong enough — and the falloff slow
+    // enough — to push particles RIGHT THROUGH the silhouette
+    // boundary, breaking the swarm outward in a luminous burst.
+    // Decays the same frame because audioTransient itself decays in
+    // the AudioReactor; here it just flashes a force.
+    float2 src = clamp(u.bodyCenter + float2(0.12 * u.audioPan, 0.0),
+                       float2(0.05), float2(0.95));
     float2 toP = p.position - src;
     float dist = length(toP) + 1e-4;
     float2 dir = toP / dist;
-    // Falloff so the kick is strongest near the source.
-    float falloff = 1.0 / (1.0 + dist * dist * 12.0);
-    float kickMag = u.audioStrength * u.audioTransient * 6.0 * falloff;
+    // Slower-falling falloff (was 12.0) so the wave reaches the
+    // silhouette edge with real force.
+    float falloff = 1.0 / (1.0 + dist * dist * 5.0);
+    float kickMag = u.audioStrength * u.audioTransient * 9.0 * falloff;
     float2 fKick  = dir * kickMag;
 
     float2 acc = fAttract + fFlow + fKick;
@@ -254,7 +266,15 @@ fragment float4 particle_fragment(
     // Mask gate: at maskGate=0 particles are visible everywhere
     // (faint ambient swarm); at maskGate=1 only inside the silhouette.
     // smoothstep gives a soft edge so the silhouette doesn't cut.
-    float gate = mix(1.0, smoothstep(0.05, 0.45, in.mask), u.maskGate);
+    // On a transient, escapeBoost relaxes the gate toward 1.0 so the
+    // shockwave-launched particles stay visible as they cross the
+    // silhouette boundary — this is what makes the burst read as the
+    // body "breaking" outward instead of just shimmering inside.
+    float strictGate = smoothstep(0.05, 0.45, in.mask);
+    float baseGate = mix(1.0, strictGate, u.maskGate);
+    float escapeBoost = saturate(u.audioStrength *
+                                 (0.6 * u.audioTransient + 0.25 * u.audioLevel) * 2.0);
+    float gate = mix(baseGate, 1.0, escapeBoost);
     a *= gate;
 
     // Color: hue centered on user-chosen base (hueShift), nudged by
