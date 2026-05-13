@@ -15,6 +15,41 @@ Entry template:
 
 ---
 
+## 2026-05-13 — `particles` branch: ASCII-dither overlay with audio-driven shockwave ring
+
+**Decision / change:**
+New toggleable visual layer: the camera image inside the person silhouette is re-rendered as a grid of ASCII glyphs (" .:-=+*#%@"), sparsest → densest by luminance. When the audio reactor detects a transient, a single ring expands outward from the body anchor, briefly densifying glyphs as it crosses them. Visually it reads like a dot-matrix display of the person, with a sonar-style pulse on every loud sound.
+
+New artefacts:
+- `RenderKit/Ascii.metal` — single fragment, three texture inputs (camera / mask / glyph atlas) + `AsciiUniforms`. Per-pixel: quantise to a grid cell of `cellSize` px; sample camera + mask at the cell center; gate by mask (smoothstep 0.05–0.30); convert luminance to glyph index `[0..N-1]`; sample the atlas at `((idx + localX) / N, localY)`; tint with a phosphor-green ramp interpolated by luminance. Premultiplied alpha out, drawn over with standard alpha blend.
+- `RenderKit/AsciiAtlas.swift` — builds a 160×16 R8 texture once at renderer init from `NSFont.monospacedSystemFont(ofSize: 13.6, weight: .bold)`, drawing each glyph centered into a 16-px cell on a black ground via CGContext + NSGraphicsContext. The shader's `glyphCount` uniform stays in sync with `AsciiAtlas.glyphs.count`.
+- `CameraMetalRenderer` gained: `asciiPipeline` (alpha-blended), `asciiAtlasTexture`, public knobs `asciiEnabled`, `asciiCellSize` (4–28 px), `asciiOrigin`, plus `triggerAsciiShockwave(origin:)` which just stamps `asciiShockBirth = now`. The encode helper packs uniforms with `shockAge = (now - birth) if 0≤2.5 else -1`, ring speed `0.55 uv/s`, gaussian width `0.045 uv`, peak boost `0.85`. Drawn as the last pass on both code paths (after trails-present and after the no-trails camera/particles overlay), so glyphs sit cleanly on top.
+- `ContentView`: HUD row gained `ascii` toggle + `cell` slider (4–28 px) + `pulse` button to fire a ring manually. The existing 9-Hz `boxTimer` also calls `tickAsciiShockwave()`, which checks `audio.latest.transient > 0.18` with a 0.18-s rate limit so a single loud event doesn't pile up overlapping rings. Body anchor (avg of hip joints) feeds both `field.bodyCenter` and `renderer.asciiOrigin` on every Vision pass.
+
+**Reason:**
+The user asked: instead of audio modulating particle motion, what if it modulates an ASCII-dithering pass on the silhouette, with shockwaves on transients? It's a cool aesthetic axis we hadn't tried — dot-matrix / terminal art is a different visual register from glowing particles, much more graphic and legible at a distance, and pairs naturally with sound because each glyph is a discrete quantum that can flip with the music. Body-anchored ring on a transient is exactly the visual idiom of a sonar ping or a spectrum-analyser sweep, which carries the audio's punctuation in a way the smooth particle field doesn't.
+
+Made it a separate toggle (not a replacement for the swarm) because:
+- Both can be on at once and they layer well — swarm cloud + ASCII silhouette + flash boxes is a maximalist arrangement; ASCII alone is the clean minimalist version.
+- Easier to A/B for the user.
+- Costs nothing when off (early return in encodeAscii).
+
+**Impact:**
+- One extra full-screen triangle pass when enabled. Per-pixel: a few texture samples + a couple `exp` calls for the ring. Trivial on M5.
+- The atlas is generated once at renderer init using AppKit (`NSGraphicsContext`), so this adds a hard AppKit dependency to RenderKit. For a macOS-only app that's fine; if iOS support matters later we'd swap in CoreText directly.
+- Glyph cell size of 12 px works well at typical drawable sizes. Smaller cells → looks more like a video; larger → more like vintage terminal. Slider exposed.
+- The shockwave ring uses ONE shared origin per renderer; multiple rapid transients overwrite each other rather than stacking. That's intentional — a stack would visually devolve into a smear of overlapping rings, while a single "latest" ring reads as a clean pulse.
+- Atlas quality limit: monospaced bold at 85% cell height is legible but the densest glyphs (`%@`) saturate similarly. We could grade better with a richer ramp (e.g. Bukhanov's 70-char gradient), but the 10-glyph ramp keeps the discrete quantisation visible — which is the point.
+- ASCII pass requires both camera + mask textures present; it silently no-ops while Vision is warming up.
+
+**Follow-up:**
+- Try multi-ring stack (3–4 most recent transients) for busy music — see whether legibility holds.
+- Make ring colour shift with audio band (low → amber, mid → green, high → cyan) instead of fixed phosphor green.
+- Quantise glyph SELECTION on a slow tick (e.g. 12 Hz) instead of every frame so cells don't twinkle from camera noise; would feel more deliberately drawn.
+- Optional: ASCII-only mode that hides the swarm entirely for a pure terminal-art look.
+
+---
+
 ## 2026-05-13 — `particles` branch: shockwave breaks the silhouette + negative-camera flash boxes
 
 **Decision / change:**

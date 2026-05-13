@@ -34,6 +34,8 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     private let compositePipeline: MTLRenderPipelineState
     private let trailDecayPipeline: MTLRenderPipelineState
     private let negativeBoxesPipeline: MTLRenderPipelineState
+    private let asciiPipeline: MTLRenderPipelineState
+    private let asciiAtlasTexture: MTLTexture?
     private var textureCache: CVMetalTextureCache?
 
     // Trail (feedback) accumulator. Two textures, ping-ponged each
@@ -95,6 +97,25 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     private let negativeBoxesBuffer: MTLBuffer
     private static let maxNegativeBoxes = 16
 
+    /// ASCII overlay: the camera feed inside the silhouette is
+    /// re-rendered as a grid of glyphs (sparse → dense by luminance).
+    /// An audio-triggered ring expands outward from `asciiOrigin`,
+    /// briefly densifying glyphs as it crosses them.
+    public var asciiEnabled: Bool = false
+    /// Glyph cell edge in pixels. Smaller = more detail, less ASCII feel.
+    public var asciiCellSize: Float = 12.0
+    /// Body-anchored origin for the audio shockwave ring (uv).
+    public var asciiOrigin: SIMD2<Float> = SIMD2<Float>(0.5, 0.5)
+    private var asciiShockBirth: CFAbsoluteTime = -1000
+
+    /// Restart the ASCII shockwave ring at `origin` (uv). Idempotent;
+    /// safe to call every frame — the renderer will only honour it
+    /// when audio actually fires a transient (caller's decision).
+    public func triggerAsciiShockwave(origin: SIMD2<Float>) {
+        asciiOrigin = origin
+        asciiShockBirth = CFAbsoluteTimeGetCurrent()
+    }
+
     public private(set) var drawnFrames: Int = 0
     public private(set) var droppedFrames: Int = 0
     private var lastFPSReport = CFAbsoluteTimeGetCurrent()
@@ -112,7 +133,8 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             let pfn = library.makeFunction(name: "passthrough_fragment"),
             let cfn = library.makeFunction(name: "composite_fragment"),
             let tfn = library.makeFunction(name: "trail_decay_fragment"),
-            let nfn = library.makeFunction(name: "negative_boxes_fragment")
+            let nfn = library.makeFunction(name: "negative_boxes_fragment"),
+            let afn = library.makeFunction(name: "ascii_fragment")
         else {
             throw RendererError.shaderNotFound
         }
@@ -158,6 +180,23 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             throw RendererError.textureCacheCreationFailed
         }
         self.negativeBoxesBuffer = nb
+
+        // ASCII pipeline: standard alpha blend over the drawable.
+        let adesc = MTLRenderPipelineDescriptor()
+        adesc.vertexFunction = vfn
+        adesc.fragmentFunction = afn
+        adesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        if let aca = adesc.colorAttachments[0] {
+            aca.isBlendingEnabled = true
+            aca.rgbBlendOperation = .add
+            aca.alphaBlendOperation = .add
+            aca.sourceRGBBlendFactor = .one          // premultiplied in shader
+            aca.sourceAlphaBlendFactor = .one
+            aca.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            aca.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
+        self.asciiPipeline = try device.makeRenderPipelineState(descriptor: adesc)
+        self.asciiAtlasTexture = AsciiAtlas.makeTexture(device: device)
 
         var cache: CVMetalTextureCache?
         let status = CVMetalTextureCacheCreate(
@@ -321,6 +360,46 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
     }
 
+    /// Encode the ASCII overlay pass. No-op if disabled, no camera or
+    /// mask, or atlas allocation failed at init.
+    private func encodeAscii(_ enc: MTLRenderCommandEncoder,
+                             viewport: SIMD2<Float>,
+                             audio: AudioFrame,
+                             audioStrength: Float) {
+        guard asciiEnabled,
+              let cam = latestCameraTexture,
+              let mask = personMaskTexture,
+              let atlas = asciiAtlasTexture
+        else { return }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let age = now - asciiShockBirth
+        // Cap visible lifetime; <0 in shader = no ring.
+        let shockAge: Float = (age >= 0 && age < 2.5) ? Float(age) : -1.0
+
+        var u = AsciiUniforms(
+            viewport:       viewport,
+            cellSize:       max(2.0, asciiCellSize),
+            glyphCount:     Float(AsciiAtlas.glyphs.count),
+            audioStrength:  audioStrength,
+            audioLevel:     audio.level,
+            audioLow:       audio.low,
+            audioTransient: audio.transient,
+            shockOrigin:    asciiOrigin,
+            shockAge:       shockAge,
+            shockSpeed:     0.55,
+            shockWidth:     0.045,
+            shockPeak:      0.85
+        )
+
+        enc.setRenderPipelineState(asciiPipeline)
+        enc.setFragmentTexture(cam,   index: 0)
+        enc.setFragmentTexture(mask,  index: 1)
+        enc.setFragmentTexture(atlas, index: 2)
+        enc.setFragmentBytes(&u, length: MemoryLayout<AsciiUniforms>.stride, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+    }
+
     private func makeTexture(from cgImage: CGImage) -> MTLTexture? {
         let width = cgImage.width
         let height = cgImage.height
@@ -447,6 +526,10 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
                 // Pass D (same encoder): negative-camera boxes flash on top.
                 let nbCount = packNegativeBoxes(now: CFAbsoluteTimeGetCurrent())
                 encodeNegativeBoxes(enc, count: nbCount)
+                // Pass E: ASCII overlay (uses field's audio reactor).
+                let ad = particleField?.audioReactor?.latest ?? .zero
+                let aStrength = particleField?.audioStrength ?? 0
+                encodeAscii(enc, viewport: viewport, audio: ad, audioStrength: aStrength)
                 enc.endEncoding()
             }
             drawnFrames += 1
@@ -511,6 +594,11 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         let nbCount = packNegativeBoxes(now: CFAbsoluteTimeGetCurrent())
         encodeNegativeBoxes(enc, count: nbCount)
 
+        // Step 4: ASCII overlay (also on top — reads camera + mask).
+        let ad = particleField?.audioReactor?.latest ?? .zero
+        let aStrength = particleField?.audioStrength ?? 0
+        encodeAscii(enc, viewport: viewport, audio: ad, audioStrength: aStrength)
+
         reportFPSIfNeeded()
 
         enc.endEncoding()
@@ -550,6 +638,22 @@ private struct NegativeBoxState {
 private struct GPUNegBox {
     var rect:  SIMD4<Float>   // cx, cy, hw, hh
     var props: SIMD4<Float>   // alpha, _, _, _
+}
+
+/// Must match the layout of the Metal `AsciiUniforms` struct in Ascii.metal.
+private struct AsciiUniforms {
+    var viewport:       SIMD2<Float>
+    var cellSize:       Float
+    var glyphCount:     Float
+    var audioStrength:  Float
+    var audioLevel:     Float
+    var audioLow:       Float
+    var audioTransient: Float
+    var shockOrigin:    SIMD2<Float>
+    var shockAge:       Float
+    var shockSpeed:     Float
+    var shockWidth:     Float
+    var shockPeak:      Float
 }
 
 /// Must match the layout of the Metal `CompositeUniforms` struct.

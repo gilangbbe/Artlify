@@ -109,7 +109,7 @@ The codebase is organized into independent, testable Swift modules. Each is smal
 | `CaptureKit`         | Wrap AVFoundation, expose `AsyncStream<CVPixelBuffer>`      | AVFoundation, Continuity Camera       |
 | `VisionKit`          | Person segmentation + pose, throttled per-request           | Vision framework                      |
 | `DiffusionKit`       | Load CoreML SD Turbo, run img2img, return MTLTexture        | CoreML, MPS, `ml-stable-diffusion`    |
-| `RenderKit`          | Metal pipeline, shaders, temporal blend, post FX, trail accumulator, negative-camera flash boxes | Metal, MetalKit               |
+| `RenderKit`          | Metal pipeline, shaders, temporal blend, post FX, trail accumulator, negative-camera flash boxes, ASCII-dither overlay | Metal, MetalKit, AppKit (atlas gen) |
 | `ParticleKit`        | GPU particle buffer + compute/render pipelines; segmentation mask gradient drives a force field. Pure Metal, no ML. Lives only on the `particles` branch. | Metal, MetalKit |
 | `AudioKit`           | Microphone tap + vDSP FFT → (low/mid/high/level/pan/transient) snapshot consumed by ParticleKit. Off-main-thread analysis. Lives only on the `particles` branch. | AVFoundation, Accelerate |
 | `PromptKit`          | Map detected features (pose, count, motion) → prompt + params | Pure Swift, no deps                 |

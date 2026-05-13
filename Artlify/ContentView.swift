@@ -29,6 +29,8 @@ struct ContentView: View {
     /// Tick rate is intentionally slow (~9 Hz) so flashes feel
     /// stuttery and intentional rather than continuous noise.
     @State private var boxTimer = Timer.publish(every: 0.11, on: .main, in: .common).autoconnect()
+    /// Last time we fired an ASCII shockwave (rate-limit transients).
+    @State private var lastAsciiShock: CFAbsoluteTime = 0
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -89,13 +91,16 @@ struct ContentView: View {
             // Update body anchor so audio shockwaves radiate from
             // inside the actual body, not screen center.
             if let f = vision.latestFrame, let field {
-                field.bodyCenter = bodyCenter(from: f.joints)
+                let bc = bodyCenter(from: f.joints)
+                field.bodyCenter = bc
+                session.renderer.asciiOrigin = bc
             }
         }
         // Periodically flash 1–3 negative-camera boxes around random
         // body joints. Empty frames (no joints) are silently skipped.
         .onReceive(boxTimer) { _ in
             tickNegativeBoxes()
+            tickAsciiShockwave()
         }
         // Keyboard: H toggles the HUD for clean recordings.
         .background(KeyHandler { key in
@@ -298,6 +303,35 @@ struct ContentView: View {
                 Spacer()
             }
 
+            HStack(spacing: 12) {
+                Toggle("ascii", isOn: Binding(
+                    get: { session.renderer.asciiEnabled },
+                    set: { session.renderer.asciiEnabled = $0 }
+                ))
+                .toggleStyle(.button)
+                .controlSize(.small)
+                Text("cell")
+                    .font(.caption)
+                Slider(value: Binding(
+                    get: { session.renderer.asciiCellSize },
+                    set: { session.renderer.asciiCellSize = $0 }
+                ), in: 4...28)
+                    .frame(width: 140)
+                Text(String(format: "%.0f", session.renderer.asciiCellSize) + " px")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Button {
+                    session.renderer.triggerAsciiShockwave(
+                        origin: session.renderer.asciiOrigin
+                    )
+                } label: {
+                    Label("pulse", systemImage: "dot.radiowaves.left.and.right")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                Spacer()
+            }
+
             audioRow(field: field)
 
             HStack(spacing: 12) {
@@ -446,6 +480,22 @@ struct ContentView: View {
                 halfSize: SIMD2<Float>(hw, hh),
                 duration: dur
             )
+        }
+    }
+
+    /// Watch the audio reactor's transient value and trigger an ASCII
+    /// shockwave when it crosses a threshold (rate-limited so a single
+    /// loud event doesn't fire dozens of overlapping rings).
+    private func tickAsciiShockwave() {
+        guard session.renderer.asciiEnabled, audio.isRunning else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        // 0.18s minimum gap between rings.
+        guard now - lastAsciiShock > 0.18 else { return }
+        if audio.latest.transient > 0.18 {
+            session.renderer.triggerAsciiShockwave(
+                origin: session.renderer.asciiOrigin
+            )
+            lastAsciiShock = now
         }
     }
 
