@@ -44,6 +44,14 @@ struct ParticleUniforms {
     var glow:       Float
     var hueShift:   Float
     var viewport:   SIMD2<Float>
+
+    var audioLevel:    Float
+    var audioLow:      Float
+    var audioMid:      Float
+    var audioHigh:     Float
+    var audioPan:      Float
+    var audioTransient:Float
+    var audioStrength: Float
 }
 
 @MainActor
@@ -70,6 +78,13 @@ public final class ParticleField {
     public var glow: Float        = 1.0
     /// Base hue (0..1). 0.55 ≈ cyan, 0.78 ≈ magenta, 0.13 ≈ amber.
     public var hueShift: Float    = 0.55
+
+    // ---- Audio reactivity
+    /// Optional reactor whose latest snapshot is read once per frame.
+    /// When nil or `audioStrength == 0`, audio modulation is a no-op.
+    public var audioReactor: AudioReactor?
+    /// 0 = ignore audio, 1 = full modulation.
+    public var audioStrength: Float = 0.0
 
     /// Number of live particles. Changing this rebuilds the buffer.
     public var count: Int = 30_000 {
@@ -183,6 +198,8 @@ public final class ParticleField {
         // that explode the integrator.
         let dt = Float(min(max(rawDt, 1.0 / 240.0), 1.0 / 20.0))
 
+        let audio = audioReactor?.latest ?? .zero
+
         var u = ParticleUniforms(
             dt:         dt,
             time:       Float(now - startTime),
@@ -194,7 +211,14 @@ public final class ParticleField {
             pointSize:  pointSize,
             glow:       glow,
             hueShift:   hueShift,
-            viewport:   viewport
+            viewport:   viewport,
+            audioLevel:    audio.level,
+            audioLow:      audio.low,
+            audioMid:      audio.mid,
+            audioHigh:     audio.high,
+            audioPan:      audio.pan,
+            audioTransient:audio.transient,
+            audioStrength: audioStrength
         )
 
         enc.setComputePipelineState(computePipeline)
@@ -223,6 +247,7 @@ public final class ParticleField {
                              viewport: SIMD2<Float>) {
         guard enabled else { return }
 
+        let audio = audioReactor?.latest ?? .zero
         var u = ParticleUniforms(
             dt:         0,
             time:       Float(CFAbsoluteTimeGetCurrent() - startTime),
@@ -234,7 +259,14 @@ public final class ParticleField {
             pointSize:  pointSize,
             glow:       glow,
             hueShift:   hueShift,
-            viewport:   viewport
+            viewport:   viewport,
+            audioLevel:    audio.level,
+            audioLow:      audio.low,
+            audioMid:      audio.mid,
+            audioHigh:     audio.high,
+            audioPan:      audio.pan,
+            audioTransient:audio.transient,
+            audioStrength: audioStrength
         )
 
         encoder.setRenderPipelineState(renderPipeline)

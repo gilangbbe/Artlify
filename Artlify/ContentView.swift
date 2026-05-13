@@ -21,6 +21,7 @@ struct ContentView: View {
     @State private var session = CameraSession()
     @State private var vision = VisionSession()
     @State private var field: ParticleField?
+    @State private var audio = AudioReactor()
     @State private var showVisionOverlay = false
     @State private var showHUD = true
 
@@ -62,6 +63,7 @@ struct ContentView: View {
             if field == nil {
                 do {
                     let f = try ParticleField(device: session.renderer.device)
+                    f.audioReactor = audio
                     session.renderer.particleField = f
                     self.field = f
                 } catch {
@@ -70,6 +72,7 @@ struct ContentView: View {
             }
         }
         .onDisappear {
+            audio.stop()
             vision.stop()
             session.stop()
         }
@@ -241,6 +244,28 @@ struct ContentView: View {
             }
 
             HStack(spacing: 12) {
+                Text("trails")
+                    .font(.caption)
+                Slider(value: Binding(
+                    get: { session.renderer.trailDecay },
+                    set: { session.renderer.trailDecay = $0 }
+                ), in: 0.80...0.995)
+                    .frame(width: 140)
+                Text(String(format: "%.3f", session.renderer.trailDecay))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Toggle("trails on", isOn: Binding(
+                    get: { session.renderer.trailsEnabled },
+                    set: { session.renderer.trailsEnabled = $0 }
+                ))
+                .toggleStyle(.button)
+                .controlSize(.small)
+                Spacer()
+            }
+
+            audioRow(field: field)
+
+            HStack(spacing: 12) {
                 Text("count")
                     .font(.caption)
                 Picker("count", selection: Binding(
@@ -264,6 +289,79 @@ struct ContentView: View {
         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func audioRow(field: ParticleField) -> some View {
+        let f = audio.latest
+        HStack(spacing: 12) {
+            Toggle(audio.isRunning ? "audio on" : "audio off", isOn: Binding(
+                get: { audio.isRunning },
+                set: { newVal in
+                    if newVal {
+                        audio.start()
+                        if field.audioStrength == 0 { field.audioStrength = 1.0 }
+                    } else {
+                        audio.stop()
+                    }
+                }
+            ))
+            .toggleStyle(.button)
+            .controlSize(.small)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("strength: " + String(format: "%.2f", field.audioStrength))
+                    .font(.caption.monospaced())
+                Slider(value: Binding(
+                    get: { field.audioStrength },
+                    set: { field.audioStrength = $0 }
+                ), in: 0...2)
+                    .frame(width: 140)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("gain: " + String(format: "%.2f", audio.gain))
+                    .font(.caption.monospaced())
+                Slider(value: Binding(
+                    get: { audio.gain },
+                    set: { audio.gain = $0 }
+                ), in: 0.1...4)
+                    .frame(width: 100)
+            }
+
+            // Tiny live meter — 4 bars: low / mid / high / level.
+            HStack(spacing: 4) {
+                meterBar("L", value: f.low,   color: .cyan)
+                meterBar("M", value: f.mid,   color: .green)
+                meterBar("H", value: f.high,  color: .pink)
+                meterBar("\u{2261}", value: f.level, color: .yellow)
+            }
+            .frame(height: 28)
+
+            if let err = audio.lastError {
+                Text(err)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.red)
+            }
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private func meterBar(_ label: String, value: Float, color: Color) -> some View {
+        VStack(spacing: 2) {
+            Rectangle()
+                .fill(color.opacity(0.25))
+                .frame(width: 10, height: 22)
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(color)
+                        .frame(width: 10, height: CGFloat(max(0, min(1, value))) * 22)
+                }
+            Text(label)
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(.secondary)
+        }
     }
 
     @ViewBuilder

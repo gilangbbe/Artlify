@@ -15,6 +15,49 @@ Entry template:
 
 ---
 
+## 2026-05-13 — `particles` branch: motion trails + audio reactivity
+
+**Decision / change:**
+Two additions on top of yesterday's silhouette-as-swarm redesign:
+
+**1. Trail accumulator (feedback render).** New `RenderKit/Trail.metal` (just a `trail_decay_fragment`: `src * decay`) plus a ping-pong pair of bgra8Unorm offscreen textures (`accumA`, `accumB`) inside `CameraMetalRenderer`. When `trailsEnabled` is on, the per-frame flow becomes three render passes: (a) decay prev→next using the trail-decay pipeline (no blending), (b) draw particles additively into next, (c) blit next to drawable. Then swap. Implies dark background — the camera blit is skipped on this code path because mixing trails with live camera looked muddy in early sketches. Accumulator is recreated whenever `drawableSizeWillChange` fires, which previously was a no-op. Default decay is **0.93** (short fluid trails); slider goes 0.80–0.995 — 0.97 gives long ribbons, 0.99 gives near-permanent ghosts.
+
+**2. Audio-reactive particle modulation.** New module `AudioKit/AudioReactor.swift`:
+- `AVAudioEngine.inputNode` tap @ 1024-frame buffers.
+- vDSP forward FFT (N=1024, Hann window, split-complex, log2n=10) on the audio thread, packed mono mix from L+R.
+- Magnitudes binned into **low (≤200 Hz)** / **mid (200–2k)** / **high (2k–8k)**, perceptual-curve compressed (`log1p(x*12)/log1p(12)`), EMA-smoothed, clamped to [0,1].
+- Broadband **level** (RMS) and a **pan** value `(R-L)/(R+L)` for stereo inputs (mono mics → 0).
+- A **transient** value = positive delta of level, gives the swarm the "snare hit" punch.
+- Engine, FFT, and analyse() all run **off the main thread**; `latest` is published via `DispatchQueue.main.async`. Class is marked `nonisolated` because the project default puts everything on `@MainActor`, and we explicitly want this one off.
+- Mic permission added: `NSMicrophoneUsageDescription` in INFOPLIST_KEY_* (both Debug + Release configs) and `com.apple.security.device.audio-input` in the entitlements file.
+
+**3. Shader uses of audio.** Seven new uniforms (`audioLevel/Low/Mid/High/Pan/Transient/Strength`). In `update_particles`:
+  - Curl-noise `flow` magnitude scaled by `1 + strength*(1.5*low + 0.4*mid)` — bass swells the swirls.
+  - Curl-noise time axis pushed by mid band so the field "breathes" with melody.
+  - **Transient shockwave**: `audioTransient` injects an outward radial force from `(0.5 + 0.4*pan, 0.5)` with `1/(1 + 12d²)` falloff. Loud claps pan-shift the kick origin left/right.
+
+In `particle_fragment`: hue shifts slightly with `audioHigh` (sibilants/cymbals tint the palette), and overall `glow` is multiplied by `1 + strength*(0.8*level + 1.5*transient)` — the room brightens with applause; sudden hits flash.
+
+**4. HUD additions** in `ContentView`: trail-decay slider + on/off toggle, audio-on toggle (also auto-bumps `audioStrength` to 1.0 first time so the user sees an effect immediately), audioStrength slider, gain slider, and a tiny 4-bar live meter (L/M/H/level). Audio errors (denied perm, no input device) surface in red next to the meter.
+
+**Reason:**
+Last iteration the swarm shape was right but the motion read as static — individual particles moved but the image as a whole didn't have any sense of **history**. Trails fix that: every motion now leaves a fluid wake, which is exactly what you want from a "galaxy of gamma rays" aesthetic. Audio is the second axis of liveness — it ties the visual to the room, so a person moving silently looks meditative and a clap makes the swarm explode outward. Together they carry the installation from "camera + dots" to something that reacts to its environment with two senses.
+
+**Impact:**
+- Trails add 2 extra render passes (decay + present) per frame, both full-screen-triangle ops with no blending or trig. ~0.2 ms extra on M5 estimated; well within budget.
+- FFT cost is N·log₂N ≈ 10k ops per audio buffer (~2.7 µs), negligible. Smoothing keeps the visible bars from twitching.
+- Coupling decision: trails currently force the dark-background visual (camera-skip path). If we ever want trails over live camera, we can add a fourth pass that blits the camera before the present.
+- Pan only works with stereo inputs; built-in MacBook mics ARE stereo on most models so this should land. If the user has a mono USB mic, pan stays at 0 and the shockwave centres at screen middle.
+- The audio class deliberately uses `@unchecked Sendable` + `nonisolated`. Justification: `latest` is the only mutable state read from another thread, and we update it only via `DispatchQueue.main.async`. The internal FFT scratch arrays are touched only by the serial `analyzeQueue`, never racing with anything.
+
+**Follow-up:**
+- Test with music playing, with conversation, with claps. Tune perceptual curve and band gains if low/mid/high feel mismatched.
+- Consider audio-reactive **trail decay** (loud peak → momentarily shorter trails for a strobe-y feel, or vice-versa).
+- Consider a band-bound colour palette (low→warm, high→cool) instead of the simple hue nudge.
+- The shockwave currently fires from a single point. We could spawn it from N points = N transient peaks the analyser detected over the last 100 ms for a polyphonic feel.
+
+---
+
 ## 2026-05-13 — `particles` branch redesign: silhouette IS the swarm
 
 **Decision / change:**

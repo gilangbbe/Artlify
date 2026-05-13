@@ -54,6 +54,16 @@ struct ParticleUniforms {
     float glow;          // overall intensity multiplier
     float hueShift;      // 0..1, base hue offset
     float2 viewport;     // drawable size in pixels
+
+    // Audio-reactive (all 0..1 unless noted). The shader treats these
+    // as additive modulation on top of the visual knobs above.
+    float audioLevel;    // broadband RMS
+    float audioLow;      // ≤ 200 Hz energy
+    float audioMid;      // 200 Hz – 2 kHz
+    float audioHigh;     // 2 kHz – 8 kHz
+    float audioPan;      // -1..+1, stereo balance
+    float audioTransient;// instantaneous attack pulse
+    float audioStrength; // 0 = audio ignored, 1 = full modulation
 };
 
 // Cheap deterministic noise — one float in, two floats out, in -1..1.
@@ -127,12 +137,31 @@ kernel void update_particles(
     float outside = saturate(1.0 - m * 2.0);
     float2 fAttract = grad * (u.attraction * (0.4 + outside));
 
-    // Curl-noise flow — divergence-free, looks like fluid.
-    float2 cseed  = p.position * u.flowScale + float2(u.time * 0.13,
-                                                      -u.time * 0.09);
-    float2 fFlow  = curlNoise(cseed) * u.flow;
+    // Curl-noise flow — divergence-free, looks like fluid. Audio low
+    // band swells the flow magnitude (bass = bigger swirls); the time
+    // axis is also pushed by the audio mid band so the whole field
+    // "breathes" with the music.
+    float audioFlowMul = 1.0 + u.audioStrength * (1.5 * u.audioLow + 0.4 * u.audioMid);
+    float audioTimeBoost = u.audioStrength * 0.7 * u.audioMid;
+    float2 cseed  = p.position * u.flowScale +
+                    float2((u.time + audioTimeBoost) * 0.13,
+                           -(u.time + audioTimeBoost) * 0.09);
+    float2 fFlow  = curlNoise(cseed) * (u.flow * audioFlowMul);
 
-    float2 acc = fAttract + fFlow;
+    // Transient shockwave: when a loud sudden sound hits, particles
+    // get an outward radial shove from a point on screen offset by
+    // the stereo pan. Decays the same frame because audioTransient
+    // itself decays in the AudioReactor; here it just flashes a force.
+    float2 src = float2(0.5 + 0.4 * u.audioPan, 0.5);
+    float2 toP = p.position - src;
+    float dist = length(toP) + 1e-4;
+    float2 dir = toP / dist;
+    // Falloff so the kick is strongest near the source.
+    float falloff = 1.0 / (1.0 + dist * dist * 12.0);
+    float kickMag = u.audioStrength * u.audioTransient * 6.0 * falloff;
+    float2 fKick  = dir * kickMag;
+
+    float2 acc = fAttract + fFlow + fKick;
     p.velocity = p.velocity * u.damping + acc * u.dt;
 
     // Cap speed so a violent gradient doesn't fling particles to infinity.
@@ -229,12 +258,19 @@ fragment float4 particle_fragment(
     a *= gate;
 
     // Color: hue centered on user-chosen base (hueShift), nudged by
-    // per-particle seed for variety and by current speed so faster
-    // particles flare slightly warmer.
-    float hue = fract(u.hueShift + (in.seed - 0.5) * 0.18 + in.speed * 0.20);
+    // per-particle seed for variety, by current speed so faster
+    // particles flare slightly warmer, and by audio high band so
+    // sharp sounds (cymbals, claps, sibilants) shift the palette.
+    float audioHueShift = u.audioStrength * 0.18 * u.audioHigh;
+    float hue = fract(u.hueShift + audioHueShift +
+                      (in.seed - 0.5) * 0.18 + in.speed * 0.20);
     float3 rgb = hsv2rgb(hue, 0.55, 1.0);
 
-    float intensity = u.glow * in.life;
+    // Loud broadband level brightens the whole field (think: room
+    // applause). Transient gives a quick flash on top.
+    float audioGlow = 1.0 + u.audioStrength * (0.8 * u.audioLevel +
+                                               1.5 * u.audioTransient);
+    float intensity = u.glow * in.life * audioGlow;
     // Premultiplied alpha for additive blending.
     return float4(rgb * a * intensity, a * intensity);
 }

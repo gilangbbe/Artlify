@@ -32,7 +32,14 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let passthroughPipeline: MTLRenderPipelineState
     private let compositePipeline: MTLRenderPipelineState
+    private let trailDecayPipeline: MTLRenderPipelineState
     private var textureCache: CVMetalTextureCache?
+
+    // Trail (feedback) accumulator. Two textures, ping-ponged each
+    // frame; lazily (re)allocated when the drawable size changes.
+    private var accumA: MTLTexture?
+    private var accumB: MTLTexture?
+    private var accumSize: CGSize = .zero
 
     // Live inputs.
     private var latestCameraTexture: MTLTexture?
@@ -68,6 +75,15 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     /// and we don't want the camera image visible behind it.
     public var darkBackground: Bool = true
 
+    /// When true, the particle layer is rendered through a feedback
+    /// accumulator that decays each frame, leaving fluid motion trails.
+    /// Implies `darkBackground` for the visible output (the camera blit
+    /// is skipped) because mixing trails with live camera looks muddy.
+    public var trailsEnabled: Bool = true
+    /// 0..0.999 — per-frame multiplier of the accumulator. 0.92 = short
+    /// fluid trails; 0.97 = long ribbons; 1.0 = forever (don't).
+    public var trailDecay: Float = 0.93
+
     public private(set) var drawnFrames: Int = 0
     public private(set) var droppedFrames: Int = 0
     private var lastFPSReport = CFAbsoluteTimeGetCurrent()
@@ -83,7 +99,8 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         guard
             let vfn = library.makeFunction(name: "passthrough_vertex"),
             let pfn = library.makeFunction(name: "passthrough_fragment"),
-            let cfn = library.makeFunction(name: "composite_fragment")
+            let cfn = library.makeFunction(name: "composite_fragment"),
+            let tfn = library.makeFunction(name: "trail_decay_fragment")
         else {
             throw RendererError.shaderNotFound
         }
@@ -99,6 +116,13 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         cdesc.fragmentFunction = cfn
         cdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
         self.compositePipeline = try device.makeRenderPipelineState(descriptor: cdesc)
+
+        let tdesc = MTLRenderPipelineDescriptor()
+        tdesc.vertexFunction = vfn
+        tdesc.fragmentFunction = tfn
+        tdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        // No blending — trail-decay overwrites the destination.
+        self.trailDecayPipeline = try device.makeRenderPipelineState(descriptor: tdesc)
 
         var cache: CVMetalTextureCache?
         let status = CVMetalTextureCacheCreate(
@@ -233,7 +257,28 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
 
     // MARK: - MTKViewDelegate
 
-    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) { }
+    public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        ensureAccumulators(size: size)
+    }
+
+    /// (Re)allocate the trail accumulator pair to match the drawable.
+    /// Cheap to call — returns immediately if size is unchanged.
+    private func ensureAccumulators(size: CGSize) {
+        let w = max(1, Int(size.width))
+        let h = max(1, Int(size.height))
+        if accumA != nil, Int(accumSize.width) == w, Int(accumSize.height) == h {
+            return
+        }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: w, height: h, mipmapped: false
+        )
+        desc.usage = [.shaderRead, .renderTarget]
+        desc.storageMode = .private
+        accumA = device.makeTexture(descriptor: desc)
+        accumB = device.makeTexture(descriptor: desc)
+        accumSize = CGSize(width: w, height: h)
+    }
 
     public func draw(in view: MTKView) {
         guard
@@ -244,16 +289,71 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
 
         let viewport = SIMD2<Float>(Float(view.drawableSize.width),
                                     Float(view.drawableSize.height))
+        ensureAccumulators(size: view.drawableSize)
 
-        // Step 1: advance particles (compute) BEFORE the render pass so
-        // the same command buffer carries both. The render pass below
-        // reads the buffer the compute kernel just wrote.
+        // Step 1: advance particles (compute) BEFORE any render pass so
+        // the same command buffer carries both. The render passes below
+        // read the buffer the compute kernel just wrote.
         if let field = particleField {
             field.encodeUpdate(commandBuffer: cmd,
                                mask: personMaskTexture,
                                viewport: viewport)
         }
 
+        // ----- Trail-accumulator path. Implies dark background.
+        if trailsEnabled,
+           let field = particleField, field.enabled,
+           let prev = accumA, let next = accumB {
+
+            // Pass A: decay prev -> next.
+            let decayDesc = MTLRenderPassDescriptor()
+            decayDesc.colorAttachments[0].texture = next
+            decayDesc.colorAttachments[0].loadAction = .clear
+            decayDesc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
+            decayDesc.colorAttachments[0].storeAction = .store
+            if let denc = cmd.makeRenderCommandEncoder(descriptor: decayDesc) {
+                var u = TrailUniforms(decay: max(0.0, min(0.999, trailDecay)))
+                denc.setRenderPipelineState(trailDecayPipeline)
+                denc.setFragmentTexture(prev, index: 0)
+                denc.setFragmentBytes(&u,
+                                      length: MemoryLayout<TrailUniforms>.stride,
+                                      index: 0)
+                denc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                denc.endEncoding()
+            }
+
+            // Pass B: particles additive into next.
+            let partDesc = MTLRenderPassDescriptor()
+            partDesc.colorAttachments[0].texture = next
+            partDesc.colorAttachments[0].loadAction = .load
+            partDesc.colorAttachments[0].storeAction = .store
+            if let penc = cmd.makeRenderCommandEncoder(descriptor: partDesc) {
+                field.encodeRender(encoder: penc,
+                                   mask: personMaskTexture,
+                                   viewport: viewport)
+                penc.endEncoding()
+            }
+
+            // Pass C: present next to drawable.
+            if let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) {
+                enc.setRenderPipelineState(passthroughPipeline)
+                enc.setFragmentTexture(next, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                enc.endEncoding()
+            }
+            drawnFrames += 1
+
+            // Swap so the texture we just rendered into becomes "prev"
+            // for next frame.
+            swap(&accumA, &accumB)
+
+            reportFPSIfNeeded()
+            cmd.present(drawable)
+            cmd.commit()
+            return
+        }
+
+        // ----- No-trails path (original behaviour).
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
         if darkBackground {
@@ -299,6 +399,14 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             field.encodeRender(encoder: enc, mask: personMaskTexture, viewport: viewport)
         }
 
+        reportFPSIfNeeded()
+
+        enc.endEncoding()
+        cmd.present(drawable)
+        cmd.commit()
+    }
+
+    private func reportFPSIfNeeded() {
         let now = CFAbsoluteTimeGetCurrent()
         if now - lastFPSReport >= 1.0 {
             let fps = Double(drawnFrames) / (now - lastFPSReport)
@@ -307,11 +415,12 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             droppedFrames = 0
             lastFPSReport = now
         }
-
-        enc.endEncoding()
-        cmd.present(drawable)
-        cmd.commit()
     }
+}
+
+/// Must match the layout of the Metal `TrailUniforms` struct in Trail.metal.
+private struct TrailUniforms {
+    var decay: Float
 }
 
 /// Must match the layout of the Metal `CompositeUniforms` struct.
