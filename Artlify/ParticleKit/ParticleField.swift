@@ -33,15 +33,17 @@ struct GPUParticle {
 
 /// Per-frame uniforms. **Layout MUST match `ParticleUniforms` in Particles.metal.**
 struct ParticleUniforms {
-    var dt:           Float
-    var time:         Float
-    var repulsion:    Float
-    var damping:      Float
-    var returnSpring: Float
-    var noise:        Float
-    var maskWeight:   Float
-    var pointSize:    Float
-    var viewport:     SIMD2<Float>
+    var dt:         Float
+    var time:       Float
+    var attraction: Float
+    var damping:    Float
+    var flow:       Float
+    var flowScale:  Float
+    var maskGate:   Float
+    var pointSize:  Float
+    var glow:       Float
+    var hueShift:   Float
+    var viewport:   SIMD2<Float>
 }
 
 @MainActor
@@ -51,13 +53,23 @@ public final class ParticleField {
     private let log = Logger(subsystem: "com.biru.Artlify", category: "ParticleKit")
 
     // ---- User knobs (read once per frame inside CameraMetalRenderer.draw)
-    public var enabled: Bool        = true
-    public var repulsion: Float     = 2.5
-    public var damping: Float       = 0.94
-    public var returnSpring: Float  = 0.6
-    public var noise: Float         = 0.05
-    public var maskWeight: Float    = 1.0
-    public var pointSize: Float     = 4.0
+    public var enabled: Bool      = true
+    /// Pull strength toward the silhouette gradient (into the body).
+    public var attraction: Float  = 1.6
+    /// Velocity damping each step. Closer to 1 = longer trails.
+    public var damping: Float     = 0.92
+    /// Curl-noise flow magnitude — the "fluid" feel.
+    public var flow: Float        = 0.45
+    /// Spatial frequency of the curl noise. Higher = tighter swirls.
+    public var flowScale: Float   = 6.0
+    /// 0 = particles visible everywhere, 1 = only inside silhouette.
+    public var maskGate: Float    = 1.0
+    /// Sprite size in pixels.
+    public var pointSize: Float   = 5.0
+    /// Overall brightness multiplier (additive).
+    public var glow: Float        = 1.0
+    /// Base hue (0..1). 0.55 ≈ cyan, 0.78 ≈ magenta, 0.13 ≈ amber.
+    public var hueShift: Float    = 0.55
 
     /// Number of live particles. Changing this rebuilds the buffer.
     public var count: Int = 30_000 {
@@ -172,15 +184,17 @@ public final class ParticleField {
         let dt = Float(min(max(rawDt, 1.0 / 240.0), 1.0 / 20.0))
 
         var u = ParticleUniforms(
-            dt:           dt,
-            time:         Float(now - startTime),
-            repulsion:    repulsion,
-            damping:      damping,
-            returnSpring: returnSpring,
-            noise:        noise,
-            maskWeight:   mask == nil ? 0.0 : maskWeight,
-            pointSize:    pointSize,
-            viewport:     viewport
+            dt:         dt,
+            time:       Float(now - startTime),
+            attraction: mask == nil ? 0.0 : attraction,
+            damping:    damping,
+            flow:       flow,
+            flowScale:  flowScale,
+            maskGate:   mask == nil ? 0.0 : maskGate,
+            pointSize:  pointSize,
+            glow:       glow,
+            hueShift:   hueShift,
+            viewport:   viewport
         )
 
         enc.setComputePipelineState(computePipeline)
@@ -202,25 +216,32 @@ public final class ParticleField {
 
     /// Encode the particle render pass into an existing render encoder
     /// (so we draw on top of whatever base layer was just rendered).
+    /// `mask` is sampled in the vertex stage so the fragment can gate
+    /// alpha by silhouette coverage.
     public func encodeRender(encoder: MTLRenderCommandEncoder,
+                             mask: MTLTexture?,
                              viewport: SIMD2<Float>) {
         guard enabled else { return }
 
         var u = ParticleUniforms(
-            dt:           0,
-            time:         Float(CFAbsoluteTimeGetCurrent() - startTime),
-            repulsion:    repulsion,
-            damping:      damping,
-            returnSpring: returnSpring,
-            noise:        noise,
-            maskWeight:   maskWeight,
-            pointSize:    pointSize,
-            viewport:     viewport
+            dt:         0,
+            time:       Float(CFAbsoluteTimeGetCurrent() - startTime),
+            attraction: attraction,
+            damping:    damping,
+            flow:       flow,
+            flowScale:  flowScale,
+            maskGate:   mask == nil ? 0.0 : maskGate,
+            pointSize:  pointSize,
+            glow:       glow,
+            hueShift:   hueShift,
+            viewport:   viewport
         )
 
         encoder.setRenderPipelineState(renderPipeline)
         encoder.setVertexBuffer(particleBuffer, offset: 0, index: 0)
         encoder.setVertexBytes(&u, length: MemoryLayout<ParticleUniforms>.stride, index: 1)
+        encoder.setVertexTexture(mask, index: 0)
+        encoder.setFragmentBytes(&u, length: MemoryLayout<ParticleUniforms>.stride, index: 1)
 
         let n = particleBuffer.length / MemoryLayout<GPUParticle>.stride
         encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: n)

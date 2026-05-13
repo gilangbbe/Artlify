@@ -25,6 +25,7 @@ public struct CameraMetalView: NSViewRepresentable {
         view.enableSetNeedsDisplay = false
         view.delegate = renderer
         view.layer?.isOpaque = true
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         return view
     }
 

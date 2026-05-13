@@ -175,6 +175,12 @@ struct ContentView: View {
                 ))
                 .toggleStyle(.button)
                 .controlSize(.small)
+                Toggle("dark bg", isOn: Binding(
+                    get: { session.renderer.darkBackground },
+                    set: { session.renderer.darkBackground = $0 }
+                ))
+                .toggleStyle(.button)
+                .controlSize(.small)
                 Text("\(field.count.formatted()) dots")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -189,31 +195,49 @@ struct ContentView: View {
             }
 
             HStack(spacing: 16) {
-                slider(label: "repulsion",
-                       value: Binding(get: { field.repulsion },
-                                      set: { field.repulsion = $0 }),
-                       range: 0...8,
-                       fmt: "%.1f")
-                slider(label: "spring",
-                       value: Binding(get: { field.returnSpring },
-                                      set: { field.returnSpring = $0 }),
-                       range: 0...3,
+                slider(label: "attraction",
+                       value: Binding(get: { field.attraction },
+                                      set: { field.attraction = $0 }),
+                       range: 0...5,
                        fmt: "%.2f")
+                slider(label: "flow",
+                       value: Binding(get: { field.flow },
+                                      set: { field.flow = $0 }),
+                       range: 0...2,
+                       fmt: "%.2f")
+                slider(label: "swirl",
+                       value: Binding(get: { field.flowScale },
+                                      set: { field.flowScale = $0 }),
+                       range: 1...20,
+                       fmt: "%.1f")
                 slider(label: "damping",
                        value: Binding(get: { field.damping },
                                       set: { field.damping = $0 }),
                        range: 0.5...0.999,
                        fmt: "%.3f")
-                slider(label: "noise",
-                       value: Binding(get: { field.noise },
-                                      set: { field.noise = $0 }),
-                       range: 0...0.4,
-                       fmt: "%.2f")
+            }
+
+            HStack(spacing: 16) {
                 slider(label: "size",
                        value: Binding(get: { field.pointSize },
                                       set: { field.pointSize = $0 }),
-                       range: 1...12,
+                       range: 1...14,
                        fmt: "%.1f")
+                slider(label: "glow",
+                       value: Binding(get: { field.glow },
+                                      set: { field.glow = $0 }),
+                       range: 0.1...3,
+                       fmt: "%.2f")
+                slider(label: "hue",
+                       value: Binding(get: { field.hueShift },
+                                      set: { field.hueShift = $0 }),
+                       range: 0...1,
+                       fmt: "%.2f")
+                slider(label: "mask gate",
+                       value: Binding(get: { field.maskGate },
+                                      set: { field.maskGate = $0 }),
+                       range: 0...1,
+                       fmt: "%.2f")
             }
 
             HStack(spacing: 12) {
@@ -230,21 +254,11 @@ struct ContentView: View {
                 .pickerStyle(.segmented)
                 .fixedSize()
                 .labelsHidden()
-
-                Text("mask weight")
-                    .font(.caption)
-                Slider(value: Binding(get: { field.maskWeight },
-                                      set: { field.maskWeight = $0 }),
-                       in: 0...1)
-                    .frame(width: 140)
-                Text(String(format: "%.2f", field.maskWeight))
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("press H to hide HUD")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
             }
-
-            Text("press H to hide HUD")
-                .font(.caption2.monospaced())
-                .foregroundStyle(.tertiary)
         }
         .padding(12)
         .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))

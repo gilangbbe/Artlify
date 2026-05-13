@@ -15,6 +15,39 @@ Entry template:
 
 ---
 
+## 2026-05-13 — `particles` branch redesign: silhouette IS the swarm
+
+**Decision / change:**
+Flipped the model on its head. The first cut had particles drifting on a light-grey camera background and being *pushed away from* the silhouette — visually busy, the camera was distracting, and the body was a hole in the field rather than the subject. New design: **dark fixed background; the segmentation mask containmaintains the swarm; the silhouette IS the visible particle field.** Gamma-ray-through-a-galaxy aesthetic.
+
+What changed:
+- `CameraMetalView` now sets the MTKView clear color to opaque black.
+- `CameraMetalRenderer` got a `darkBackground: Bool = true` flag. When set, `draw(in:)` skips the camera/composite blit entirely; the render pass clears to black and only the additive particle layer draws.
+- `Particles.metal` rewritten:
+  - Force model is now **attractive**: gradient of the mask points INTO the silhouette, so `+grad * attraction` pulls outside-particles inward. The pull is scaled by `(0.4 + outside)` so deep-inside particles barely feel it and just float.
+  - Drift is **divergence-free curl noise** (`curl = (∂P/∂y, -∂P/∂x)` of value-noise) instead of straight value-noise. This is what makes it look like fluid rather than vibration.
+  - Life decays **faster in empty space** (`0.04 + 0.45 * (1 - 4m)`), and respawn picks a fresh random point via per-particle hash. Net effect: density self-regulates to track the silhouette — particles outside die quickly, respawns that happen to land inside survive.
+  - `home` and `returnSpring` are gone (kept the field in `GPUParticle` for layout parity, unused).
+  - Vertex shader now samples the mask too and passes coverage through to fragment.
+  - Fragment **gates alpha by mask coverage** via `mix(1, smoothstep(0.05, 0.45, mask), maskGate)` — at `maskGate=1` particles only show inside the body; at 0 you get an ambient swarm everywhere. Dot is rendered as bright core + soft halo for the glow look. Color is hue-shift based, low saturation (0.55) so it reads as light, not paint.
+- `ParticleField` knobs replaced: `attraction`, `flow`, `flowScale`, `damping`, `maskGate`, `pointSize`, `glow`, `hueShift`. Defaults tuned (`attraction=1.6`, `flow=0.45`, `flowScale=6`, `damping=0.92`, `glow=1.0`, `hueShift=0.55` ≈ cyan). `encodeRender(...)` now also takes the mask (vertex stage samples it) and binds the uniforms to the fragment buffer too.
+- `ContentView` particle panel rebuilt with the new sliders (attraction, flow, swirl, damping, size, glow, hue, mask gate) and a "dark bg" toggle next to the particles toggle so you can flip back to camera-behind for debugging.
+
+**Reason:**
+The "silhouette as force field" version was a tech demo — you read it as a person + dots, not as one image. For an installation we want a **single readable image**: a body-shaped luminous cloud floating in a dark room. That requires (a) the background to vanish and (b) the mask to be a containment field for the particles, not a repellent. Curl noise instead of plain noise was non-negotiable once we wanted the motion to read as fluid; straight value-noise looks like jitter, curl looks like flow.
+
+**Impact:**
+- The build is still ~one compute dispatch + one point-sprite draw per frame, well under the 16.6 ms budget on M5. Curl-noise tap costs 4 extra `vnoise` calls per particle vs. 2 — negligible.
+- The change is breaking for anyone who saved knob values from the previous build (different field names). Acceptable; we have no persistence yet.
+- The `darkBackground` flag is general-purpose — future installation modes (e.g. "silhouette as ASCII", "silhouette as ribbons") can reuse the same render-pass-clear-to-black path.
+
+**Follow-up:**
+- Test on hardware. Expected behaviour: empty room → a faint ambient cyan haze (or near-black if `maskGate=1`); person enters → a body-shaped cloud of swirling cyan dots materialises and tracks them; movement makes the cloud trail and reform.
+- If the silhouette edge looks too crisp, soften the smoothstep range in the fragment gate (currently 0.05–0.45) or pre-blur the mask in `RenderKit`.
+- Decide later: per-particle long trails via a decaying accumulator texture, audio-reactive `flow`, multi-color presets (cyan/magenta/amber).
+
+---
+
 ## 2026-05-12 — New branch `particles`: silhouette as a force field
 
 **Decision / change:**

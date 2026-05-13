@@ -62,6 +62,12 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     /// sliders to its knobs without going through the renderer.
     public var particleField: ParticleField?
 
+    /// When true, the camera/composite blit is skipped and the drawable
+    /// is left at its clear color (black). Used by the `particles` branch
+    /// art-installation mode where the silhouette IS the particle field
+    /// and we don't want the camera image visible behind it.
+    public var darkBackground: Bool = true
+
     public private(set) var drawnFrames: Int = 0
     public private(set) var droppedFrames: Int = 0
     private var lastFPSReport = CFAbsoluteTimeGetCurrent()
@@ -250,7 +256,13 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
 
         guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
-        if compositeEnabled, let cam = latestCameraTexture, let next = aiNext {
+        if darkBackground {
+            // Skip the camera/composite layer entirely. The render pass's
+            // clear color (set on the MTKView to opaque black) gives us
+            // the dark gallery background. Particles draw additively
+            // below.
+            drawnFrames += 1
+        } else if compositeEnabled, let cam = latestCameraTexture, let next = aiNext {
             let prev = aiPrev ?? next
             // Blend t = how far we are into the most recent style cycle.
             let elapsed = CFAbsoluteTimeGetCurrent() - aiNextSubmittedAt
@@ -284,7 +296,7 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
 
         // Step 2: particles draw additively on top of whatever just landed.
         if let field = particleField {
-            field.encodeRender(encoder: enc, viewport: viewport)
+            field.encodeRender(encoder: enc, mask: personMaskTexture, viewport: viewport)
         }
 
         let now = CFAbsoluteTimeGetCurrent()
