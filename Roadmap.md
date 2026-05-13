@@ -77,6 +77,7 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 
 | Item                                                                            | Status        | Notes                                                                              |
 | ------------------------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------------------- |
+| **Branch `particles` — silhouette-as-force-field installation** | build green, untested on hardware | New `ParticleKit` module: GPU compute particles repelled by the segmentation-mask gradient. Diffusion path removed from UI on this branch. HUD has 5 sliders + count picker + H-key hide. |
 | **M5 — Hardening + demo polish** | not started, unblocked by M4 ship | First-launch model downloader, diffusion-stall fade-out, 30-min thermal soak, minimal-HUD demo mode. |
 
 ---
@@ -85,6 +86,7 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 
 | Item                                                                                       | Date       |
 | ------------------------------------------------------------------------------------------ | ---------- |
+| **Branch `particles` scaffold** — `ParticleKit` module (`Particles.metal` compute+render, `ParticleField` Observable class), renderer wired to dispatch the compute pass and draw point-sprites additively over the camera blit, ContentView rewritten with particle HUD (enable / count picker / 5 sliders / mask-weight) and H-key HUD-toggle. Diffusion + PromptKit references removed from UI on this branch. Build green, 0 warnings. | 2026-05-12 |
 | Bugfix — presets/prompts had no visible effect because `strength × stepCount = 0.55 × 2 ≈ 1` effective denoising step. Bumped defaults to `strength=0.78, steps=4` and rebalanced every preset's `suggestedStrength` to 0.75–0.82. Trades ~660 ms/pass for ~1.2 s/pass; prompt now actually steers the output. | 2026-05-12 |
 | Mask mode tri-state — `Composite.metal` + `CameraMetalRenderer.MaskMode { full, person, background }` replacing the boolean `mask_enabled`. Default flipped to `.background` so prompts like "starry night" repaint the environment while the person stays as live camera. HUD checkbox replaced with 3-segment Picker. | 2026-05-12 |
 | Bugfix — `DiffusionBenchmark.init()` was hardcoded to the 512 model bundle while `variant` defaulted to 384, so the first live pass exploded with `Encoder.Error 0`. Init now uses literal defaults that match the property declarations. | 2026-05-11 |

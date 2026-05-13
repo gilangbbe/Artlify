@@ -53,3 +53,5 @@ fastlane/test_output
 # Playgrounds
 timeline.xctimeline
 playground.xcplayground
+
+.venv/

@@ -15,7 +15,36 @@ Entry template:
 
 ---
 
-## 2026-05-11 — M0 verified on hardware: Continuity Camera <150 ms
+## 2026-05-12 — New branch `particles`: silhouette as a force field
+
+**Decision / change:**
+Branched off `main` (not `controlnet`) to try a completely non-AI direction: **a classic interactive particle installation.** Camera → Vision person segmentation → mask gradient is interpreted as a repulsive force field that pushes a GPU particle buffer around in real time. No diffusion, no prompts, no PromptKit references in the UI.
+
+New module `ParticleKit/`:
+- `Particles.metal` — compute kernel `update_particles` (mask sample + 4-tap spatial gradient → repulsion + small value-noise drift + spring-to-home + damping; positions wrapped in [0,1]²) and a point-sprite render pair (`particle_vertex`, `particle_fragment`) doing soft round dots, hue derived from per-particle seed and current speed, premultiplied alpha for additive blending.
+- `ParticleField.swift` — `@MainActor @Observable public final class ParticleField`. Owns the device, particle buffer (32 B per particle: position, velocity, home, seed, life), compute pipeline, render pipeline (additive, sourceRGB=.one + destRGB=.one). Public knobs: `enabled`, `repulsion=2.5`, `damping=0.94`, `returnSpring=0.6`, `noise=0.05`, `maskWeight=1.0`, `pointSize=4.0`, `count=30_000` (didSet rebuilds buffer). Methods: `encodeUpdate(commandBuffer:mask:viewport:)` (compute) and `encodeRender(encoder:viewport:)` (renders into an existing render encoder, on top of the camera blit).
+
+`CameraMetalRenderer` got a `var particleField: ParticleField?` and `draw(in:)` now: split command-buffer setup from render-encoder creation, dispatch `encodeUpdate` (compute pass) before `makeRenderCommandEncoder`, then call `encodeRender` after the camera blit so dots draw on top.
+
+`ContentView` rewritten: removed every diffusion/PromptKit reference (`DiffusionBenchmark`, `LiveDiffusionDriver`, `StylePresets`, prompt fields, mask-mode picker — all gone from the UI). New HUD: enable toggle, count Picker [10k / 30k / 60k / 120k], reset button, sliders for repulsion / spring / damping / noise / size / mask weight. Added a tiny `KeyHandler` `NSViewRepresentable` so the **H key toggles the entire HUD** for clean recordings. Vision overlay toggle preserved.
+
+**Reason:**
+We spent two days trying to get the AI-stylization pipeline (controlnet branch, txt2img + cfg + canny) to produce convincing face-to-anime output and it never quite landed — the model's face-quality at 384/512 is the hard ceiling, not anything in our code. Rather than burn more time on model swaps and ControlNet tuning, take the same camera + segmentation pipeline we already trust and apply it to a completely different aesthetic where Apple Vision is the *only* ML in the loop and quality is bounded by shader craft, not by a 1B-param CoreML model.
+
+**Impact:**
+- Branch is independent: `controlnet` stays around as 842ad57 if we want to come back. `main` is still untouched. `particles` is the new active line.
+- Diffusion files (`DiffusionKit/`, `AppShell/DiffusionBenchmark.swift`, `AppShell/LiveDiffusionDriver.swift`, `PromptKit/`) **remain on disk on this branch but are no longer referenced by `ContentView`**. They build cleanly (they were self-consistent on main). Decide later whether to delete them on this branch or keep the option to re-enable.
+- Defaults (30 k particles, 60-FPS draw on M5 base) are budget-safe — compute pass is one threadgroup-aligned dispatch reading a small mask texture, render pass is one `drawPrimitives(.point)` call. The full frame is still well under our 16.6 ms budget.
+- Two access-control bugs caught during first build: `public var particleField` exposing an internal `ParticleField` (fixed by making `ParticleField` and its public surface explicitly `public`), and a stale `case .stopped` in `ContentView.statusText` left over from a copy-paste — `CameraSession.Status` only has `.idle/.starting/.running/.failed`.
+
+**Follow-up:**
+- Test on hardware. Expected: empty-room view shows a soft drifting field of glowing dots; when a person enters, particles get shoved out of the silhouette and trail behind motion.
+- Decide whether to add: attraction mode (sign flip on `repulsion`), velocity-trail rendering (motion blur via decaying accumulator texture), audio reactivity. **Do not add these until the basic field looks right.**
+- Decide whether to delete unused diffusion files on this branch to make the tree honest.
+
+---
+
+
 
 **Decision / change:**
 Ran the M0 build on the target M5 with an iPhone connected via cable. End-to-end latency from physical motion to on-screen draw measured **<150 ms**, well within the assumption in `ProjectDocument.md` §13 #2.

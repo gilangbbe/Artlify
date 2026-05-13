@@ -57,6 +57,11 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     public var maskMode: MaskMode = .background
     public var maskSoftness: Float = 1.0
 
+    /// Optional particle layer drawn additively on top of the camera /
+    /// composite pass. Owned externally so the SwiftUI shell can bind
+    /// sliders to its knobs without going through the renderer.
+    public var particleField: ParticleField?
+
     public private(set) var drawnFrames: Int = 0
     public private(set) var droppedFrames: Int = 0
     private var lastFPSReport = CFAbsoluteTimeGetCurrent()
@@ -228,9 +233,22 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         guard
             let drawable = view.currentDrawable,
             let rpd = view.currentRenderPassDescriptor,
-            let cmd = commandQueue.makeCommandBuffer(),
-            let enc = cmd.makeRenderCommandEncoder(descriptor: rpd)
+            let cmd = commandQueue.makeCommandBuffer()
         else { return }
+
+        let viewport = SIMD2<Float>(Float(view.drawableSize.width),
+                                    Float(view.drawableSize.height))
+
+        // Step 1: advance particles (compute) BEFORE the render pass so
+        // the same command buffer carries both. The render pass below
+        // reads the buffer the compute kernel just wrote.
+        if let field = particleField {
+            field.encodeUpdate(commandBuffer: cmd,
+                               mask: personMaskTexture,
+                               viewport: viewport)
+        }
+
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
         if compositeEnabled, let cam = latestCameraTexture, let next = aiNext {
             let prev = aiPrev ?? next
@@ -262,6 +280,11 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             enc.setFragmentTexture(cam, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             drawnFrames += 1
+        }
+
+        // Step 2: particles draw additively on top of whatever just landed.
+        if let field = particleField {
+            field.encodeRender(encoder: enc, viewport: viewport)
         }
 
         let now = CFAbsoluteTimeGetCurrent()
