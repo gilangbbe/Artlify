@@ -15,6 +15,130 @@ Entry template:
 
 ---
 
+---
+
+## 2026-05-13 — `particles` branch: blob-tracking bounding-box overlay (replaces rejected tracery)
+
+**Decision / change:**
+The previous tracery interpretation was wrong too. User clarified: "blob tracking" here means detect the blobs (moving body regions) and draw **flashing bounding boxes** around them — same flicker idiom as the negative-camera boxes — with **strings connecting** the boxes. Deleted `AppShell/BlobTracery.swift`.
+
+New artefacts:
+- `AppShell/BlobBoxes.swift`:
+  - `BlobBox`: id (joint id), smoothed `center` uv, `halfSize` uv, stable hashed `hue`, `flashUntil` wall-clock gate, `lastSeen`.
+  - `BlobBoxStore` (`@Observable`):
+    - `updatePositions(joints:now:)` — EMA-smooths each blob's centre toward the latest joint position (`smoothing = 0.55`), creates new blobs with randomised box sizes (0.045–0.085 uv per axis so trackers feel varied not gridlike), prunes anything not seen in 0.6 s.
+    - `tickFlash(now:)` — for each blob whose flash has expired, roll `flashProbability` (default 0.30) and on success light it for `flashDuration` 0.16 s. Boxes are *only drawn* while their flash is live, so the overlay is a sparse strobe of ~30 % of trackers at any moment rather than a constant grid.
+  - `BlobBoxesOverlay` — SwiftUI `Canvas`, 60 Hz `Timer.publish` repaint clock so the on/off transitions are crisp. Per lit box: triangular alpha envelope inside the flash window, glow underlay (4 px, 25 % α) + crisp 1 px outline (95 % α), corner-tick brackets at all four corners (length = 36 % of the shorter half-side), centre dot. Connective web: drawn first (so box outlines sit on top of their endpoints), every-pair white line with a soft glow under and a thin bright top stroke.
+- `ContentView` driver: `updateBlobs()` runs from the existing `.onChange(of: vision.passCount)` block (positions). `blobs.tickFlash(now:)` added to the existing 9 Hz `boxTimer` callback so the blob flicker and the negative-camera flicker share one rhythm. HUD row: `blobs` toggle, `strings` toggle, `flash` probability slider (0.05–0.8), `intensity` slider (0.2–1.5).
+
+**Reason:**
+Reading the brief literally this time: "when you detected the blob i want you to just put the bounding boxes on the blob. the way like you created the negative camera effect. it will flash like that. and it will be random. each blob or bounding boxes will have connected string."
+
+Three concrete decisions follow:
+1. **Blob = pose joint** still — Vision already gives stable, ID-tagged points cheaper than mask connected components, and per the brief we just need a tracker to anchor a box on. The boxes don't need to match the actual silhouette geometry; they're trackers, not segmentations.
+2. **Flash gate, not always-on draw.** This is what makes it match the negative-camera box behaviour — boxes pop on, flash, vanish, another subset comes on. A constantly-drawn box per joint would read as 19 static rectangles, which is ugly and not what was asked for. Implementation is a `flashUntil` per box checked at draw time; the box is invisible outside its window. Triangular envelope inside the window so it brightens then fades rather than hard-clipping.
+3. **All-pairs string web** between currently-lit boxes only. With probability 0.30 and ~10 trackers visible, ~3 boxes are lit at once → 3 connecting segments typical. Wires the diagram together without becoming a dense mesh. Strings are white (with a soft glow under-stroke), not coloured, so they don't fight the per-blob hues on the box outlines.
+
+The corner tick brackets matter: a plain rectangle outline reads as "geometry"; brackets at the corners read as "tracker reticle". Tiny visual move, big difference in the diagrammatic feel.
+
+**Impact:**
+- Build green. Untested on hardware.
+- Per-frame cost is bounded: ≤19 boxes, only ~30 % drawn at once, ≤(6 choose 2) = 15 string segments. Trivial for `Canvas`.
+- Same `boxTimer` already drives `tickNegativeBoxes` and `tickAsciiShockwave`; adding `blobs.tickFlash` means all three flicker layers share a single 9 Hz pulse, which is going to read as more cohesive than three separate clocks.
+- Position smoothing (EMA 0.55) is necessary — at Vision's 15 Hz with raw assignment the boxes were jumping a few pixels every frame; smoothed they breathe.
+- Two non-issues from the previous iteration carried over correctly: explicit `import Combine` for `Timer.publish`, hash-based per-id stable hue.
+
+**Follow-up:**
+- Audio reactivity: bump `flashProbability` momentarily on `audio.latest.transient` so loud sounds light up the whole web at once. Right now the overlay is mute.
+- Maybe a "burst" button that lights every box for one flash duration so users can see the full diagram on demand.
+- If multi-person is added later, key boxes by `(personIndex, jointId)` so two people don't get their boxes coloured identically.
+- The all-pairs web is fine at small N; if we ever drive it with mask CCs (10+ blobs typical) we should switch to nearest-neighbour or MST so the web doesn't become a dense mesh.
+
+---
+
+## 2026-05-13 — `particles` branch: blob-tracking tracery overlay (REJECTED, removed)
+
+> Superseded by the blob-box entry above. User wanted bounding boxes + connecting strings (like the negative-camera flash idiom), not flowing splines through joint history. Code deleted, journal entry kept as a record of the wrong path and for the Catmull-Rom math notes that may be useful elsewhere.
+
+**Decision / change:**
+The previous head-tethered "thought flashes" were rejected by the user — wrong mental model entirely. The correct technique is **blob tracking + tracery**: follow each moving body region over time and render that trajectory as ornamental, interlaced line art. Deleted `AppShell/ThoughtFlash.swift` outright.
+
+New artefacts:
+- `AppShell/BlobTracery.swift`: three types.
+  - `BlobTrack`: per-joint rolling history `[(uv, t)]` plus a stable per-id `hue` and `lastSeen`.
+  - `BlobTraceryStore` (`@Observable`): `tracks: [String: BlobTrack]`, `historyLength` (default 28), `pruneAfter` (default 0.6 s). `update(joints:now:)` appends new samples (skipping micro-displacements <0.4 % uv to avoid spline degeneracy when the subject is still), trims history, prunes stale tracks.
+  - `BlobTraceryOverlay`: SwiftUI `Canvas`, 30 Hz internal `Timer.publish` repaint. For each track:
+    - smooth Catmull–Rom spline through the history, expressed as cubic Beziers via the standard `c1 = P1 + (P2 − P0)/6, c2 = P2 − (P3 − P1)/6`, with reflected endpoints so it actually passes through P[0] and P[last];
+    - drawn twice — a wider faint glow underlay (4.5 px, 22 % α) plus a crisp 1.1-px head line (85 % α) — the two-stroke layering is what reads as "tracery" rather than a single plotted curve;
+    - small fade-in dots at every sample to give the spline an obvious tail→head direction;
+    - at the head, three rotated, interlaced ellipses oriented along the local velocity tangent; ellipse radius scales mildly with speed so fast-moving joints get bigger flourishes.
+  - Per-track hue is an FNV-1a hash of the joint id mod 360 → each tracked joint has its own consistent colour thread, which is what makes overlapping multi-joint tracery actually read as separate woven threads.
+- `ContentView` driver: `updateTracery()` is called from the existing `.onChange(of: vision.passCount)` block. Pulls confident joints (≥0.4), flips Vision's bottom-left y to top-left uv, hands them to the store. HUD row swapped to `tracery` toggle + `length` slider (history depth 6–60) + `intensity` slider (0.2–1.5 master α/brightness). All thought-related state and the separate `thoughtTimer` are gone.
+
+**Reason:**
+"Tracery" is a specific architectural ornament idiom — interlaced, often double-line stonework you see in Gothic windows. Combined with "blob tracking" the brief is unambiguous: take the moving body parts as the blobs, render their motion as ornamental flowing curves. Two implementation choices follow directly:
+
+1. **Blob = pose joint, not mask connected component.** Vision already gives us 19 joints at 15 Hz with confidence scores, which is enough discrete trackers for the visual to feel rich. A real per-pixel blob extraction off the segmentation mask would add CPU cost (connected components, centroid tracking, ID matching across frames) for almost no visual gain — joints already cluster around the same body regions a CC pass would find, and they come pre-identified so we don't need a Hungarian-matcher to keep blob colours stable.
+2. **Tracery look comes from layering, not from one fancy stroke.** A single thin line through the history reads as a plot. Glow underlay + crisp top line + per-vertex dots + head-end ornament reads as ornamental art. That four-element recipe is what separates "trail" from "tracery" visually.
+
+The Catmull-Rom path matters: linear segments between Vision samples (~15 Hz) would jitter visibly at 30 Hz repaint. Catmull-Rom interpolates smoothly through every sample with C¹ continuity, no curve-fitting, no smoothing latency.
+
+**Impact:**
+- Build green. Untested on hardware.
+- Per-frame work is bounded: ≤19 tracks × ≤28 samples = ≤532 path segments + 19 head ornaments. Trivial for `Canvas`.
+- The "skip micro-moves" guard (4 px-equivalent) is doing real work — without it, a stationary subject would pile up identical samples and the spline would degenerate into NaN-prone zero-length segments.
+- The Catmull-Rom math went through one rewrite. First pass tried centripetal (α=0.5) with a giant ad-hoc tangent formula that I'm not sure was even correct. Replaced with the textbook uniform-CR → cubic Bezier conversion (`c = P + (next − prev)/6`). It's three lines, demonstrably right, and visually identical for the smooth motions a body produces. Lesson: don't reach for centripetal until uniform actually misbehaves on real input.
+- Hit the `simd` import gotcha: `simd_distance` lives in the `simd` module, not `Foundation`/`SwiftUI`. Easy fix, but worth noting alongside the recurring `import Combine` Swift-6 trap.
+- Layering: tracery draws above all Metal layers and below the HUD, same plane the rejected thought-flash overlay used. That's intentional — the tracery is a separate diegetic plane (lines drawn "in the air"), not a body surface treatment.
+
+**Follow-up:**
+- Audio reactivity: feed `audio.latest.level` into `intensity` and `audio.latest.transient` into a momentary head-flourish radius bump; right now the overlay is mute.
+- Per-track lifetime decay on the spline α (older segments more transparent than newer) — currently the dots fade, the spline doesn't.
+- Maybe a "ghost" copy of the spline offset by ±2 px perpendicular for a true interlaced double-stroke, which is the most literal Gothic-tracery move. The ellipses already imply this but a perpendicular-offset spline would seal the look.
+- If multi-person becomes interesting, key tracks by `(personIndex, jointId)` so two people's threads don't collapse into the same hue.
+
+---
+
+## 2026-05-13 — `particles` branch: ASCII colour + chaotic head-tethered thought flashes (REJECTED, removed)
+
+> Superseded by the blob-tracery entry above. The thought-flash geometry overlay was a misread of the brief — user wanted ornamental tracery following blobs, not labelled containers tied to the head. Code deleted, journal entry kept for the ASCII colour decision and as a record of the wrong path.
+
+**Decision / change:**
+
+**1. Customisable ASCII colour.** Two new uniforms on `AsciiUniforms` (`colorLow`, `colorHigh`, `float3`s, padded to `SIMD4<Float>` Swift-side because Metal's float3 is 16-byte aligned and a naked `SIMD3<Float>` from Swift won't match the layout). The shader's tint mix `mix(colorLow, colorHigh, lum) * g` replaces the previous hard-coded phosphor green. HUD got a single `hue` slider (0..1) which feeds `applyAsciiHue(_)`: builds two NSColors at `(hue, 0.85, 0.95)` and `(hue, 0.35, 1.00)`, converts each to deviceRGB, packs into `asciiColorLow/High`. So one knob shifts the whole palette — amber, cyan, magenta, blood-red, etc. — while keeping the dark/bright contrast that makes the glyphs legible.
+
+**2. Thought-flash overlay** (`AppShell/ThoughtFlash.swift` — DELETED). New SwiftUI `Canvas` overlay sitting between the MTKView and the HUD. Renders an in-memory pool of `ThoughtFlash` records: each is a random shape (rect / circle / triangle / hexagon), at a random position in a [0.18, 0.45] uv-radius ring around the head, rotated -18..+18°, with 1–3 lines of pseudo-mathematical text inside (`42 + 17 = ?`, `x² + 5x + 9 = 0`, `∫ e^(-x²) dx ≈ 0.886`, `sin(127°) = 0.799`, `E ≈ 412.05`, plus weird single words like `why`, `later`, `?`). Each flash has a triangular alpha envelope over a random `0.55..1.6` s lifetime, its own random hue, and is connected by a thin stroked line back to the detected head joint with a tiny dot at the head end so the anchor is unambiguous.
+
+Why SwiftUI Canvas instead of another Metal pass: text rendering and arbitrary stroked geometry are trivial in Canvas and ugly in Metal. We're at most 12–30 shapes simultaneously, each a stroked path + a few `Text` runs — cost is negligible and `.drawingGroup()` ensures the overlay composites through Metal anyway.
+
+Driver in `ContentView`:
+- `headUV(from:)` extracts the head joint, preferring `nose` → `head` → `ear` substring matches (Vision's joint names vary across OS), falls back to whole-body centroid, then nil (overlay scatters across full frame).
+- `Timer.publish(every: 0.35)` (~3 Hz baseline) drives `tickThoughts()` — culls expired, then 65% chance to spawn 1 flash. Staggering keeps the rhythm chaotic-feeling rather than metronomic.
+- On every detected audio transient (`audio.latest.transient > 0.18`), spawn an additional 2-shape burst. So loud sounds visually overload the "head" with thoughts — perfect for the "this person has too much to think about" intent.
+- HUD: `thoughts` toggle (clears the pool when disabled), `capacity` slider (4–30, oldest evicted), manual `burst` button.
+
+**Reason:**
+(1) The fixed phosphor-green ASCII looked great but made the layer feel locked to a single emotional register. With a hue knob, ASCII can be the gentle background green for ambient mode, then crank to angry red when the room gets loud, etc. One slider, one line of NSColor math — cheapest possible knob for the largest visual range.
+
+(2) The user's brief: random geometry on the dark background, with calculation-like numbers, tethered by string to the head, chaotic-but-artistic, portraying "a person has a lot to think about." The visual idiom this lands on is technical-diagram chaos — like an illustrated brain anatomy drawing, but the labels are math equations and the labels live just briefly before being replaced. SwiftUI Canvas was the right primitive because every shape needs text inside AND a connecting line, and SwiftUI's text rendering is excellent.
+
+Kept the formula generators deliberately mixed (clean arithmetic + algebra + integrals + physics + plain words like "why" / "later" / `13:47`) so the overlay reads as a real wandering mind rather than a calculator demo. The single-word `?` and `todo` slots are doing a surprising amount of emotional work — they break up the math density and feel intimately human.
+
+**Impact:**
+- Canvas overlay paints at 30 Hz (its own internal Timer publisher) so envelopes animate smoothly. Anchored to head position which only updates at Vision rate (~15 Hz); some perceptible step but the lines feel more deliberate than smooth-following would.
+- `ThoughtFlashStore` is `@Observable`; the SwiftUI re-render path is the standard one (mutation → view diff). Capacity-evict policy keeps the pool bounded so even a sustained transient burst can't allocate unbounded shapes.
+- `Combine` had to be imported in `ThoughtFlash.swift` (same Swift 6 strictness gotcha as ContentView).
+- Hue knob is decoupled from audio for now — if we wanted, audio-high band could push it cyan and audio-low push amber per frame. Left as a follow-up because manual control is more useful for setup-tuning.
+- The thought-flashes draw underneath the HUD but on TOP of all Metal layers (swarm, trails, neg boxes, ASCII). That layering decision was deliberate: thoughts are a separate diegetic plane (literally "in the air around the person"), not part of the body's visual treatment.
+
+**Follow-up:**
+- Detect `right_wrist`/`left_wrist` joints and let some flashes anchor to wrists too (not just head) for variety — the visual would read as "thoughts spilling out of the hands".
+- Make spawn rate scale with audio level so silent rooms have a few sparse thoughts and busy rooms get a dense cloud.
+- Optional curve / bezier on the connecting line (slight droop) so it feels like a string under gravity rather than a straight ruler line.
+- A small per-flash "glitch" pass: occasionally render the text scrambled then resolve to its real value mid-life.
+
+---
+
 ## 2026-05-13 — `particles` branch: ASCII-dither overlay with audio-driven shockwave ring
 
 **Decision / change:**

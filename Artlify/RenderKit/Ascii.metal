@@ -41,6 +41,11 @@ struct AsciiUniforms {
     float  shockSpeed;   // uv per second (radius = age * speed)
     float  shockWidth;   // gaussian ring width in uv
     float  shockPeak;    // 0..1 brightness boost at ring center
+
+    // Per-glyph tint. `colorLow` is the dark-cell colour, `colorHigh`
+    // the bright-cell colour; per-pixel mix is by luminance.
+    float3 colorLow;
+    float3 colorHigh;
 };
 
 fragment float4 ascii_fragment(
@@ -103,9 +108,7 @@ fragment float4 ascii_fragment(
     float  g = atlas.sample(s, atlasUV).r;
 
     // Phosphor-greenish tint, slightly hotter for brighter cells.
-    float3 col = mix(float3(0.45, 0.95, 0.55),
-                     float3(0.85, 1.00, 0.70),
-                     lum) * g;
+    float3 col = mix(u.colorLow, u.colorHigh, lum) * g;
 
     float a = g * gate;
     if (a <= 0.001) discard_fragment();

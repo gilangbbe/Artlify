@@ -31,11 +31,26 @@ struct ContentView: View {
     @State private var boxTimer = Timer.publish(every: 0.11, on: .main, in: .common).autoconnect()
     /// Last time we fired an ASCII shockwave (rate-limit transients).
     @State private var lastAsciiShock: CFAbsoluteTime = 0
+    @State private var blobs = BlobBoxStore()
+    @State private var blobsEnabled: Bool = true
+    @State private var blobsIntensity: Double = 1.0
+    @State private var blobsStrings: Bool = true
+    @State private var asciiHue: Double = 0.33   // green default
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             CameraMetalView(renderer: session.renderer)
                 .ignoresSafeArea()
+
+            if blobsEnabled {
+                GeometryReader { proxy in
+                    BlobBoxesOverlay(store: blobs,
+                                     intensity: blobsIntensity,
+                                     drawStrings: blobsStrings)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                }
+                .ignoresSafeArea()
+            }
 
             if showVisionOverlay {
                 GeometryReader { proxy in
@@ -95,12 +110,18 @@ struct ContentView: View {
                 field.bodyCenter = bc
                 session.renderer.asciiOrigin = bc
             }
+            // Push fresh joint samples into the blob-box store so
+            // each tracked body point's bounding box follows the body.
+            updateBlobs()
         }
         // Periodically flash 1–3 negative-camera boxes around random
         // body joints. Empty frames (no joints) are silently skipped.
         .onReceive(boxTimer) { _ in
             tickNegativeBoxes()
             tickAsciiShockwave()
+            if blobsEnabled {
+                blobs.tickFlash(now: CFAbsoluteTimeGetCurrent())
+            }
         }
         // Keyboard: H toggles the HUD for clean recordings.
         .background(KeyHandler { key in
@@ -316,10 +337,23 @@ struct ContentView: View {
                     get: { session.renderer.asciiCellSize },
                     set: { session.renderer.asciiCellSize = $0 }
                 ), in: 4...28)
-                    .frame(width: 140)
+                    .frame(width: 120)
                 Text(String(format: "%.0f", session.renderer.asciiCellSize) + " px")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
+                Text("hue")
+                    .font(.caption)
+                Slider(value: Binding(
+                    get: { asciiHue },
+                    set: { newVal in
+                        asciiHue = newVal
+                        applyAsciiHue(newVal)
+                    }
+                ), in: 0...1)
+                    .frame(width: 110)
+                Circle()
+                    .fill(Color(hue: asciiHue, saturation: 0.7, brightness: 1.0))
+                    .frame(width: 14, height: 14)
                 Button {
                     session.renderer.triggerAsciiShockwave(
                         origin: session.renderer.asciiOrigin
@@ -329,6 +363,36 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                Spacer()
+            }
+
+            HStack(spacing: 12) {
+                Toggle("blobs", isOn: $blobsEnabled)
+                    .toggleStyle(.button)
+                    .controlSize(.small)
+                    .onChange(of: blobsEnabled) { _, on in
+                        if !on { blobs.clear() }
+                    }
+                Toggle("strings", isOn: $blobsStrings)
+                    .toggleStyle(.button)
+                    .controlSize(.small)
+                Text("flash")
+                    .font(.caption)
+                Slider(value: Binding(
+                    get: { blobs.flashProbability },
+                    set: { blobs.flashProbability = $0 }
+                ), in: 0.05...0.8)
+                    .frame(width: 110)
+                Text(String(format: "%.2f", blobs.flashProbability))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Text("intensity")
+                    .font(.caption)
+                Slider(value: $blobsIntensity, in: 0.2...1.5)
+                    .frame(width: 110)
+                Text(String(format: "%.2f", blobsIntensity))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
                 Spacer()
             }
 
@@ -496,6 +560,42 @@ struct ContentView: View {
                 origin: session.renderer.asciiOrigin
             )
             lastAsciiShock = now
+        }
+    }
+
+    // MARK: - Blob-box driver
+
+    /// Pull confident joints from the latest Vision frame, flip
+    /// Vision's bottom-left y to top-left uv, push positions into the
+    /// store. The flash gate is driven separately on the box timer.
+    private func updateBlobs() {
+        guard blobsEnabled, let f = vision.latestFrame else { return }
+        let samples: [(id: String, uv: SIMD2<Float>)] = f.joints
+            .filter { $0.confidence >= 0.4 }
+            .map { j in
+                (id: j.id,
+                 uv: SIMD2<Float>(Float(j.point.x),
+                                  Float(1.0 - j.point.y)))
+            }
+        blobs.updatePositions(joints: samples,
+                              now: CFAbsoluteTime(f.timestamp))
+    }
+
+    /// Map a single hue slider into the ASCII shader's two tint colours
+    /// (low = darker / more saturated, high = brighter / lighter).
+    private func applyAsciiHue(_ hue: Double) {
+        let lowNS  = NSColor(hue: CGFloat(hue), saturation: 0.85,
+                             brightness: 0.95, alpha: 1.0)
+        let highNS = NSColor(hue: CGFloat(hue), saturation: 0.35,
+                             brightness: 1.00, alpha: 1.0)
+        if let l = lowNS.usingColorSpace(.deviceRGB),
+           let h = highNS.usingColorSpace(.deviceRGB) {
+            session.renderer.asciiColorLow = SIMD3<Float>(
+                Float(l.redComponent), Float(l.greenComponent), Float(l.blueComponent)
+            )
+            session.renderer.asciiColorHigh = SIMD3<Float>(
+                Float(h.redComponent), Float(h.greenComponent), Float(h.blueComponent)
+            )
         }
     }
 

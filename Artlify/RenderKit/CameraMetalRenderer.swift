@@ -106,6 +106,11 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     public var asciiCellSize: Float = 12.0
     /// Body-anchored origin for the audio shockwave ring (uv).
     public var asciiOrigin: SIMD2<Float> = SIMD2<Float>(0.5, 0.5)
+    /// Glyph tint at minimum / maximum luminance. Defaults to the
+    /// classic phosphor green ramp; HUD lets the user push to amber,
+    /// cyan, magenta, etc.
+    public var asciiColorLow:  SIMD3<Float> = SIMD3<Float>(0.45, 0.95, 0.55)
+    public var asciiColorHigh: SIMD3<Float> = SIMD3<Float>(0.85, 1.00, 0.70)
     private var asciiShockBirth: CFAbsoluteTime = -1000
 
     /// Restart the ASCII shockwave ring at `origin` (uv). Idempotent;
@@ -389,7 +394,9 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             shockAge:       shockAge,
             shockSpeed:     0.55,
             shockWidth:     0.045,
-            shockPeak:      0.85
+            shockPeak:      0.85,
+            colorLow:       SIMD4<Float>(asciiColorLow.x,  asciiColorLow.y,  asciiColorLow.z,  0),
+            colorHigh:      SIMD4<Float>(asciiColorHigh.x, asciiColorHigh.y, asciiColorHigh.z, 0)
         )
 
         enc.setRenderPipelineState(asciiPipeline)
@@ -654,6 +661,10 @@ private struct AsciiUniforms {
     var shockSpeed:     Float
     var shockWidth:     Float
     var shockPeak:      Float
+    // float3 in Metal is 16-byte aligned. We reflect that with a
+    // padded SIMD4 on the Swift side; the shader reads .xyz.
+    var colorLow:       SIMD4<Float>
+    var colorHigh:      SIMD4<Float>
 }
 
 /// Must match the layout of the Metal `CompositeUniforms` struct.
