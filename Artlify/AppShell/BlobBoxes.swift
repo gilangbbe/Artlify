@@ -34,6 +34,10 @@ struct BlobBox: Identifiable {
     /// what reproduces the negative-box flicker idiom.
     var flashUntil: CFAbsoluteTime
     var lastSeen: CFAbsoluteTime
+    /// Short label drawn under the box. Re-rolled every time the box
+    /// lights up so the readouts feel like live telemetry rather than
+    /// static name tags.
+    var label: String
 }
 
 @Observable
@@ -80,7 +84,8 @@ final class BlobBoxStore {
                     halfSize: SIMD2(w, h),
                     hue: Self.hash01(j.id),
                     flashUntil: 0,
-                    lastSeen: now
+                    lastSeen: now,
+                    label: Self.randomLabel()
                 )
             }
         }
@@ -98,6 +103,10 @@ final class BlobBoxStore {
             if b.flashUntil > now { continue }
             if Double.random(in: 0...1) < flashProbability {
                 b.flashUntil = now + flashDuration
+                // New label every flash — the readouts churn instead
+                // of feeling like permanent name tags. Keeps the
+                // overlay alive even when the subject is stationary.
+                b.label = Self.randomLabel()
                 boxes[id] = b
             }
         }
@@ -115,6 +124,64 @@ final class BlobBoxStore {
         }
         return Double(h % 360) / 360.0
     }
+
+    /// Short fragment to draw under a tracker box. Mix of pure 6-digit
+    /// numeric IDs and short C-language tokens so the readouts feel
+    /// like a debugger spew rather than a single repetitive format.
+    /// 60/40 split favouring numbers because they're shorter and read
+    /// faster at small sizes.
+    private static func randomLabel() -> String {
+        if Double.random(in: 0...1) < 0.6 {
+            // 6-digit zero-padded — reads like an object id / hex.
+            return String(format: "%06d", Int.random(in: 0...999_999))
+        }
+        return cSnippets.randomElement() ?? "NULL"
+    }
+
+    /// Tiny C-flavoured tokens. Kept short (≤ 14 chars) so they fit
+    /// comfortably under the smallest boxes. Mix of pointer / hex /
+    /// keyword / loop / call shapes for visual variety.
+    private static let cSnippets: [String] = [
+        "void*",
+        "0xDEADBEEF",
+        "0xCAFEBABE",
+        "NULL",
+        "for(;;)",
+        "int x;",
+        "&ptr",
+        "malloc(8)",
+        "free(p)",
+        "sizeof(int)",
+        "struct{}",
+        "static",
+        "char**",
+        "return 0;",
+        "goto err;",
+        "#define",
+        "#include",
+        "if(!p)",
+        "++i",
+        "x &= 0xff",
+        "x|=1<<3",
+        "x>>4",
+        "x^=y",
+        "argv[0]",
+        "errno",
+        "EXIT",
+        "fprintf",
+        "printf(\"%d\")",
+        "memcpy",
+        "assert(p)",
+        "0x7FFF",
+        "0xFF00",
+        "size_t",
+        "uint32_t",
+        "int8_t",
+        "NaN",
+        "INF",
+        "SEG_FAULT",
+        "EOF",
+    ]
 }
 
 // MARK: - View
@@ -214,6 +281,26 @@ struct BlobBoxesOverlay: View {
         let dot = Path(ellipseIn:
             CGRect(x: cx - 1.5, y: cy - 1.5, width: 3, height: 3))
         ctx.fill(dot, with: .color(colour.opacity(alpha)))
+
+        // Telemetry label sitting just under the box. Drawn in white
+        // (not the box hue) so it reads as readout text rather than
+        // part of the bracket geometry. Monospaced for the debugger
+        // feel; small and tight so it never crowds the tracker.
+        let text = Text(b.label)
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundColor(.white.opacity(alpha))
+        let resolved = ctx.resolve(text)
+        let textSize = resolved.measure(in: CGSize(width: 200, height: 20))
+        let textOrigin = CGPoint(x: cx - textSize.width / 2,
+                                 y: rect.maxY + 3)
+        // Faint dark plate so the label reads on top of bright camera
+        // pixels; alpha-tied to the envelope so it strobes with the box.
+        let plate = Path(roundedRect:
+            CGRect(x: textOrigin.x - 3, y: textOrigin.y - 1,
+                   width: textSize.width + 6, height: textSize.height + 2),
+            cornerRadius: 2)
+        ctx.fill(plate, with: .color(.black.opacity(0.45 * alpha)))
+        ctx.draw(resolved, at: textOrigin, anchor: .topLeading)
     }
 
     /// Connect every lit box to every other lit box with a thin string.

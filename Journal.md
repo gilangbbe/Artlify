@@ -22,6 +22,8 @@ Entry template:
 **Decision / change:**
 The previous tracery interpretation was wrong too. User clarified: "blob tracking" here means detect the blobs (moving body regions) and draw **flashing bounding boxes** around them — same flicker idiom as the negative-camera boxes — with **strings connecting** the boxes. Deleted `AppShell/BlobTracery.swift`.
 
+**Telemetry labels (follow-up in same day):** each lit box now also draws a short white monospaced label on a faint dark plate just under the bracket. Label is re-rolled at the start of each flash (so they churn like a debugger spew, not static name tags). 60 % chance of a zero-padded 6-digit numeric id (`042817`, `999003`, …), 40 % chance of a short C-language token from a curated 38-entry pool (`void*`, `0xDEADBEEF`, `for(;;)`, `malloc(8)`, `&ptr`, `x|=1<<3`, `printf("%d")`, `SEG_FAULT`, …). Pool entries are kept ≤ 14 chars so they fit under the smallest boxes; mix of pointer / hex / loop / call / type shapes for visual variety. Label alpha is tied to the box's triangular envelope so it strobes in sync with the bracket. Plate sits over arbitrary camera content so the text stays legible.
+
 New artefacts:
 - `AppShell/BlobBoxes.swift`:
   - `BlobBox`: id (joint id), smoothed `center` uv, `halfSize` uv, stable hashed `hue`, `flashUntil` wall-clock gate, `lastSeen`.
