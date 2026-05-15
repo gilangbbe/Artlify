@@ -31,6 +31,7 @@ struct ContentView: View {
     @State private var boxTimer = Timer.publish(every: 0.11, on: .main, in: .common).autoconnect()
     /// Last time we fired an ASCII shockwave (rate-limit transients).
     @State private var lastAsciiShock: CFAbsoluteTime = 0
+    @State private var game = GameEngine()
     @State private var blobs = BlobBoxStore()
     @State private var blobsEnabled: Bool = true
     @State private var blobsIntensity: Double = 1.0
@@ -41,6 +42,8 @@ struct ContentView: View {
         ZStack(alignment: .topLeading) {
             CameraMetalView(renderer: session.renderer)
                 .ignoresSafeArea()
+
+            AstronautOverlay(game: game)
 
             if blobsEnabled {
                 GeometryReader { proxy in
@@ -72,6 +75,10 @@ struct ContentView: View {
                     }
                 }
             }
+
+            // Game HUD sits on top of all other overlays so it is
+            // never obscured by the particle panel or status bars.
+            AstronautHUD(game: game)
         }
         .frame(minWidth: 720, minHeight: 480)
         .background(Color.black)
@@ -92,11 +99,21 @@ struct ContentView: View {
                     print("ParticleField init failed: \(error)")
                 }
             }
+
+            // Game renderer callbacks — fire shockwave + particle burst
+            // at the UV position of each hit or star-dust collection.
+            game.onHit = { [renderer = session.renderer] pos in
+                renderer.triggerAsciiShockwave(origin: pos)
+            }
+            game.onCollect = { [renderer = session.renderer] pos in
+                renderer.triggerAsciiShockwave(origin: pos)
+            }
         }
         .onDisappear {
             audio.stop()
             vision.stop()
             session.stop()
+            game.stop()
         }
         // Push the latest segmentation mask into the renderer whenever
         // VisionSession publishes a new frame. The particle compute
@@ -113,6 +130,10 @@ struct ContentView: View {
             // Push fresh joint samples into the blob-box store so
             // each tracked body point's bounding box follows the body.
             updateBlobs()
+            // Drive body-state detection + collision every Vision pass.
+            if let f = vision.latestFrame {
+                game.update(frame: f)
+            }
         }
         // Periodically flash 1–3 negative-camera boxes around random
         // body joints. Empty frames (no joints) are silently skipped.
