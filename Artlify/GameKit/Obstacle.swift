@@ -37,49 +37,47 @@ struct GameObstacle: Identifiable {
 
 struct ObstacleSpawner {
 
-    private var rockTimer   : Double = 1.2   // initial delay before first rock
-    private var meteorTimer : Double = 2.5
-    private var dustTimer   : Double = 4.5
+    // Single unified countdown. When it fires the screen is clear and a
+    // random obstacle type is chosen — guaranteeing variety and exactly
+    // one object on screen at a time.
+    private var nextTimer: Double = 1.5
 
     mutating func reset() {
-        rockTimer   = 1.2
-        meteorTimer = 2.5
-        dustTimer   = 4.5
+        nextTimer = 1.5
     }
 
-    /// Advance timers by `dt` seconds and call `spawn` for each new obstacle.
-    /// `speedMult` is the current difficulty multiplier (speeds scale with it;
-    /// intervals narrow independently so the density rises faster than speed).
     mutating func tick(dt: Double,
                        elapsed: Double,
                        speedMult: Double,
                        hasObstacle: Bool,
                        spawn: (GameObstacle) -> Void) {
+        nextTimer -= dt
+        guard nextTimer <= 0 && !hasObstacle else { return }
+
         // Interval shrinks 10 % every 15 s, floored at 45 % of original.
         let diffFactor = max(0.45, 1.0 - floor(elapsed / 15.0) * 0.10)
 
-        // ---- Rocks (ground zone, Y 0.78…0.88) — spawn off the left edge
-        rockTimer -= dt
-        if rockTimer <= 0 && !hasObstacle {
-            let large  = Double.random(in: 0...1) < 0.25
-            let rockH  : Float = large ? 0.055 : 0.038
+        // 40 % rock · 40 % meteor · 20 % star-dust
+        let roll = Double.random(in: 0..<1)
+
+        if roll < 0.40 {
+            // ---- Rock (ground)
+            let large = Double.random(in: 0..<1) < 0.25
+            let rockH : Float = large ? 0.055 : 0.038
             spawn(GameObstacle(
                 kind:  .rock,
                 x:     -0.10,
-                y:     1.0 - rockH,   // bottom edge flush with screen floor
+                y:     1.0 - rockH,
                 w:     large ? 0.04 : 0.025,
                 h:     rockH,
                 speed: Float(large ? 0.12 : 0.15)
             ))
-            rockTimer = Double.random(in: 1.8...3.2) * diffFactor
-        }
+            nextTimer = Double.random(in: 1.8...3.2) * diffFactor
 
-        // ---- Meteors (mid / high zone, Y 0.15…0.58) — spawn off the left edge
-        meteorTimer -= dt
-        if meteorTimer <= 0 && !hasObstacle {
-            let high  = Double.random(in: 0...1) < 0.45
-            // Randomise height only — width stays fixed so the streak reads consistently.
-            let h = Float.random(in: 0.022...0.075)
+        } else if roll < 0.80 {
+            // ---- Meteor (midair)
+            let high = Double.random(in: 0..<1) < 0.45
+            let h    = Float.random(in: 0.022...0.075)
             spawn(GameObstacle(
                 kind:  .meteor,
                 x:     -0.10,
@@ -88,12 +86,10 @@ struct ObstacleSpawner {
                 h:     h,
                 speed: Float(high ? 0.28 : 0.18)
             ))
-            meteorTimer = Double.random(in: 2.5...4.2) * diffFactor
-        }
+            nextTimer = Double.random(in: 2.5...4.2) * diffFactor
 
-        // ---- Star-dust (mid zone, Y 0.25…0.55) — spawn off the left edge
-        dustTimer -= dt
-        if dustTimer <= 0 && !hasObstacle {
+        } else {
+            // ---- Star-dust (collectible)
             spawn(GameObstacle(
                 kind:  .starDust,
                 x:     -0.10,
@@ -102,7 +98,7 @@ struct ObstacleSpawner {
                 h:     0.04,
                 speed: 0.13
             ))
-            dustTimer = Double.random(in: 4.0...7.0) * diffFactor
+            nextTimer = Double.random(in: 4.0...7.0) * diffFactor
         }
     }
 }
