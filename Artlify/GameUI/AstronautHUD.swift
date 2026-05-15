@@ -192,6 +192,29 @@ struct AstronautHUD: View {
                 .shadow(color: Color(red: 0.25, green: 0.55, blue: 1.0).opacity(0.9), radius: 10)
                 .shadow(color: Color(red: 0.25, green: 0.55, blue: 1.0).opacity(0.5), radius: 22)
 
+            // Cause of death
+            if let kind = game.killedByKind {
+                let label = kind == .rock ? "STRUCK BY ROCK" : "STRUCK BY METEOR"
+                let hue: Double = kind == .rock ? 0.00 : 0.07
+                Text(label)
+                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                    .foregroundStyle(Color(hue: hue, saturation: 0.80, brightness: 1.0))
+                    .kerning(2)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        Color(hue: hue, saturation: 0.80, brightness: 1.0).opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 6)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(
+                                Color(hue: hue, saturation: 0.80, brightness: 1.0).opacity(0.45),
+                                lineWidth: 1
+                            )
+                    )
+            }
+
             Divider()
                 .background(Color(red: 0.35, green: 0.65, blue: 1.0).opacity(0.45))
 

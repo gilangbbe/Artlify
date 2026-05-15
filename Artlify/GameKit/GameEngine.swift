@@ -34,11 +34,13 @@ final class GameEngine {
 
     // MARK: - Observed state
 
-    private(set) var gameState  : GameState = .idle
-    private(set) var starDust   : Int = 1
-    private(set) var score      : Int = 0
-    private(set) var highScore  : Int = UserDefaults.standard.integer(forKey: "astro.highScore")
-    private(set) var obstacles  : [GameObstacle] = []
+    private(set) var gameState    : GameState = .idle
+    private(set) var starDust     : Int = 1
+    private(set) var score        : Int = 0
+    private(set) var highScore    : Int = UserDefaults.standard.integer(forKey: "astro.highScore")
+    private(set) var obstacles    : [GameObstacle] = []
+    /// Kind of the obstacle that caused the last life loss (shown in the game-over panel).
+    private(set) var killedByKind : ObstacleKind? = nil
 
     // MARK: - Child systems
 
@@ -53,10 +55,11 @@ final class GameEngine {
 
     // MARK: - Private
 
-    private var spawner        = ObstacleSpawner()
-    private var elapsedSeconds : Double = 0
-    private var gameLoopTask   : Task<Void, Never>?
-    private var countdownTask  : Task<Void, Never>?
+    private var spawner         = ObstacleSpawner()
+    private var elapsedSeconds  : Double = 0
+    private var lastVisionTime  : CFAbsoluteTime = 0
+    private var gameLoopTask    : Task<Void, Never>?
+    private var countdownTask   : Task<Void, Never>?
 
     // MARK: - Public API
 
@@ -81,15 +84,25 @@ final class GameEngine {
         gameState = .idle
     }
 
-    /// Feed every Vision frame here. Drives body-state updates and collision.
-    /// Called from ContentView's `.onChange(of: vision.passCount)`.
+    /// Feed every Vision frame here. Drives body-state, obstacle movement,
+    /// spawning, and collision — all locked to the camera segmentation cadence.
     func update(frame: VisionFrame) {
         body.update(frame: frame)
         guard gameState == .playing else { return }
+
+        // Compute dt from the previous Vision frame so obstacle speed is
+        // independent of the actual Vision Hz (typically ~15 Hz).
+        let now = CFAbsoluteTimeGetCurrent()
+        let dt  = lastVisionTime > 0 ? min(now - lastVisionTime, 0.15) : 0
+        lastVisionTime = now
+
+        if dt > 0 { tickObstacles(dt: dt) }
+
         CollisionSystem.resolve(
             obstacles: &obstacles,
             mask:      frame.personMask,
-            bodyRect:  body.bodyRect
+            bodyRect:  body.bodyRect,
+            bodyState: body.state
         ) { [weak self] event in
             self?.handle(event)
         }
@@ -103,36 +116,38 @@ final class GameEngine {
         obstacles      = []
         spawner        = ObstacleSpawner()
         elapsedSeconds = 0
+        lastVisionTime = 0
         starDust       = 1
         score          = 0
+        killedByKind   = nil
         body.reset()
     }
 
     private func startGameLoop() {
+        // Game loop only tracks elapsed time and score — obstacle movement
+        // is driven by Vision frames in update(frame:) instead.
         gameLoopTask = Task { [weak self] in
             var last = CFAbsoluteTimeGetCurrent()
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(16))
                 guard let self, self.gameState == .playing else { break }
                 let now = CFAbsoluteTimeGetCurrent()
-                // Cap dt so a hiccup doesn't launch obstacles off-screen.
-                self.tick(dt: min(now - last, 0.05))
+                let dt  = min(now - last, 0.05)
+                self.elapsedSeconds += dt
+                let timePart = Int(self.elapsedSeconds * 10)
+                if timePart > self.score { self.score = timePart }
                 last = now
             }
         }
     }
 
-    private func tick(dt: Double) {
-        elapsedSeconds += dt
+    /// Move, spawn, and purge obstacles — called once per Vision frame.
+    private func tickObstacles(dt: Double) {
+        let speedMult      = 1.0 + floor(elapsedSeconds / 15.0) * 0.08
+        let hasObstacle = !obstacles.isEmpty
 
-        // Score: time × 10, plus bonuses applied in handle(_:).
-        let timePart = Int(elapsedSeconds * 10)
-        if timePart > score { score = timePart }
-
-        // Difficulty: speed ramps 8 % per 15-second bracket.
-        let speedMult = 1.0 + floor(elapsedSeconds / 15.0) * 0.08
-
-        spawner.tick(dt: dt, elapsed: elapsedSeconds, speedMult: speedMult) { [weak self] obs in
+        spawner.tick(dt: dt, elapsed: elapsedSeconds, speedMult: speedMult,
+                     hasObstacle: hasObstacle) { [weak self] obs in
             self?.obstacles.append(obs)
         }
 
@@ -140,7 +155,6 @@ final class GameEngine {
             obstacles[i].x += Float(Double(obstacles[i].speed) * speedMult * dt)
         }
 
-        // Purge obstacles that have left the right edge or been consumed.
         obstacles.removeAll { $0.x > 1.05 || $0.consumed }
     }
 
@@ -148,6 +162,7 @@ final class GameEngine {
         switch event.kind {
         case .hit:
             onHit?(event.center)
+            killedByKind = event.obstacleKind
             starDust -= 1
             log.info("Hit! starDust=\(self.starDust)")
             if starDust <= 0 {
