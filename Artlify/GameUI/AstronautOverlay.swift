@@ -23,10 +23,9 @@ struct AstronautOverlay: View {
         TimelineView(.animation) { tl in
             Canvas { ctx, size in
                 let t = tl.date.timeIntervalSinceReferenceDate
-                drawGround(ctx: ctx, size: size)
                 for obs in game.obstacles where !obs.consumed {
                     switch obs.kind {
-                    case .rock:     drawObstacle(obs, hue: 0.00, label: "IMPACT", ctx: ctx, size: size)
+                    case .rock:     drawObstacle(obs, hue: 0.00, label: "METEOR", ctx: ctx, size: size)
                     case .meteor:   drawMeteor(obs,   ctx: ctx, size: size)
                     case .starDust: drawStarDust(obs, ctx: ctx, size: size, t: t)
                     }

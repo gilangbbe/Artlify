@@ -75,13 +75,15 @@ struct ObstacleSpawner {
         // ---- Meteors (mid / high zone, Y 0.15…0.58) — spawn off the left edge
         meteorTimer -= dt
         if meteorTimer <= 0 {
-            let high = Double.random(in: 0...1) < 0.45
+            let high  = Double.random(in: 0...1) < 0.45
+            // Randomise height only — width stays fixed so the streak reads consistently.
+            let h = Float.random(in: 0.022...0.075)
             spawn(GameObstacle(
                 kind:  .meteor,
                 x:     -0.10,
                 y:     high ? Float.random(in: 0.15...0.35) : Float.random(in: 0.35...0.58),
                 w:     0.09,
-                h:     0.04,
+                h:     h,
                 speed: Float(high ? 0.55 : 0.35)
             ))
             meteorTimer = Double.random(in: 2.5...4.2) * diffFactor
