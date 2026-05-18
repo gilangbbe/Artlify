@@ -34,6 +34,7 @@ struct LiveTile: Identifiable {
     var state: State = .active
     var hitTime: Double?
     var missedTime: Double?
+    var autoPlayed: Bool = false   // ghost note already fired for this tile
 }
 
 // MARK: - Engine
@@ -51,6 +52,7 @@ final class TileEngine {
     private(set) var songTime: Double = 0
     private(set) var isPlaying: Bool = false
     private(set) var isGameOver: Bool = false
+    private(set) var isSongComplete: Bool = false
 
     // ---- Constants
     let fallSpeed: Double = 0.22    // UV per second
@@ -91,8 +93,9 @@ final class TileEngine {
 
     func start() {
         guard !isPlaying else { return }
-        isPlaying  = true
-        isGameOver = false
+        isPlaying      = true
+        isGameOver     = false
+        isSongComplete = false
         // Offset startTime into the future by spawnLeadTime so songTime
         // begins at -spawnLeadTime. The first beat-0 tile then spawns
         // immediately but at y = spawnLeadY (off-screen top) and falls
@@ -135,7 +138,7 @@ final class TileEngine {
         spawnTiles()
         processCollisions()
         pruneTiles()
-        advanceLoop()
+        checkSongEnd()
     }
 
     // MARK: - Geometry helpers (used by overlay)
@@ -267,7 +270,16 @@ final class TileEngine {
                 }
             }
 
-            guard didHit else { continue }
+            // Auto-play: fire a quiet ghost note once the beat passes so
+            // the melody is always audible even on a miss.
+            if !didHit {
+                if !activeTiles[i].autoPlayed,
+                   songTime > activeTiles[i].absoluteTargetTime + 0.05 {
+                    activeTiles[i].autoPlayed = true
+                    notePlayer.playGhost(lane: lane)
+                }
+                continue
+            }
 
             // Timing accuracy: how close to the "perfect" beat moment
             let timingErr  = abs(songTime - activeTiles[i].absoluteTargetTime)
@@ -295,14 +307,14 @@ final class TileEngine {
         }
     }
 
-    private func advanceLoop() {
+    private func checkSongEnd() {
+        // All events must have been spawned...
         guard nextEventIdx >= song.events.count else { return }
-        // song.totalDuration is in seconds; convert to beats for loopOffset arithmetic.
-        let totalBeats = song.totalDuration / song.beatDuration
-        // Absolute seconds when the full loop has played out.
-        let loopEndSeconds = (loopOffset + totalBeats) * song.beatDuration
-        guard songTime >= loopEndSeconds - 1.0 else { return }
-        loopOffset   += totalBeats
-        nextEventIdx  = 0
+        // ...and every tile resolved (hit tiles are pruned after 0.55 s,
+        // missed tiles trigger isGameOver before we get here, so an empty
+        // activeTiles array here means a perfect clear).
+        guard activeTiles.isEmpty else { return }
+        isSongComplete = true
+        isPlaying      = false
     }
 }

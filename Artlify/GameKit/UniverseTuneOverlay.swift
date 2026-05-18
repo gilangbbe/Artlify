@@ -35,7 +35,10 @@ struct UniverseTuneOverlay: View {
 
             // Counter-mirror: the parent ZStack has scaleEffect(x:-1),
             // so apply the inverse here to keep text readable.
-            if engine.isGameOver {
+            if engine.isSongComplete {
+                songCompleteScreen
+                    .scaleEffect(x: -1, y: 1)
+            } else if engine.isGameOver {
                 gameOverScreen
                     .scaleEffect(x: -1, y: 1)
             } else {
@@ -103,7 +106,9 @@ struct UniverseTuneOverlay: View {
                 // Brightness ramps up as tile approaches hitZoneY
                 let dist   = abs(topY - engine.hitZoneY)
                 let bright = CGFloat(max(0.35, 1.0 - dist * 1.3))
-                drawActiveTile(rect: rect, lane: tile.lane, color: color, bright: bright, ctx: ctx)
+                let seed = tile.lane * 1000 + Int(tile.absoluteTargetTime * 100)
+                drawActiveTile(rect: rect, lane: tile.lane, color: color,
+                               bright: bright, now: now, seed: seed, ctx: ctx)
 
             case .hit:
                 let age   = st - (tile.hitTime ?? st)
@@ -121,53 +126,128 @@ struct UniverseTuneOverlay: View {
     // MARK: - Tile draw helpers
 
     private func drawActiveTile(rect: CGRect, lane: Int, color: Color, bright: CGFloat,
-                                ctx: GraphicsContext) {
-        let path = Path(rect)
+                                now: Double, seed: Int, ctx: GraphicsContext) {
+        let path = wavyTileShape(rect, now: now, seed: seed)
 
-        // Fill layers: dim body + edge glow
+        // Base fill + glow — same two-layer style as before.
         ctx.fill(path, with: .color(color.opacity(0.12 * bright)))
         ctx.fill(path, with: .color(color.opacity(0.28 * bright)))
-
-        // Outer glow stroke
         ctx.stroke(path, with: .color(color.opacity(0.22 * bright)), lineWidth: 6)
-        // Crisp inner border
         ctx.stroke(path, with: .color(color.opacity(0.90 * bright)), lineWidth: 1.5)
 
-        // Corner tick brackets
-        let tick = max(6, min(rect.width, rect.height) * 0.22)
-        var ticks = Path()
-        // Top-left
-        ticks.move(to:    CGPoint(x: rect.minX, y: rect.minY + tick))
-        ticks.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
-        ticks.addLine(to: CGPoint(x: rect.minX + tick, y: rect.minY))
-        // Top-right
-        ticks.move(to:    CGPoint(x: rect.maxX - tick, y: rect.minY))
-        ticks.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
-        ticks.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + tick))
-        // Bottom-right
-        ticks.move(to:    CGPoint(x: rect.maxX, y: rect.maxY - tick))
-        ticks.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-        ticks.addLine(to: CGPoint(x: rect.maxX - tick, y: rect.maxY))
-        // Bottom-left
-        ticks.move(to:    CGPoint(x: rect.minX + tick, y: rect.maxY))
-        ticks.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-        ticks.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - tick))
-        ctx.stroke(ticks, with: .color(color.opacity(bright)), lineWidth: 2)
+        // Fire gradient: yellow-white core → orange → red → transparent,
+        // covering the top 40 % of the tile. Flickers with time.
+        let fireH   = min(rect.height * 0.42, 34.0)
+        let flicker = CGFloat(0.80 + 0.20 * sin(now * 9.7 + Double(seed) * 1.9))
+        ctx.fill(Path(CGRect(x: rect.minX, y: rect.minY,
+                              width: rect.width, height: fireH)),
+                 with: .linearGradient(
+                    Gradient(stops: [
+                        .init(color: Color(red: 1.0, green: 0.97, blue: 0.72)
+                                .opacity(0.92 * bright * flicker),  location: 0.00),
+                        .init(color: Color(red: 1.0, green: 0.58, blue: 0.08)
+                                .opacity(0.78 * bright * flicker),  location: 0.30),
+                        .init(color: Color(red: 0.88, green: 0.12, blue: 0.02)
+                                .opacity(0.42 * bright * flicker),  location: 0.68),
+                        .init(color: color.opacity(0),               location: 1.00),
+                    ]),
+                    startPoint: CGPoint(x: rect.midX, y: rect.minY),
+                    endPoint:   CGPoint(x: rect.midX, y: rect.minY + fireH)
+                 ))
 
-        // Lane note name in tile when it's near the hit zone
+        // Warm corona extending above the tile top — the heat haze / glow.
+        let coronaH = fireH * 0.75
+        ctx.fill(Path(CGRect(x: rect.minX - 4, y: rect.minY - coronaH,
+                              width: rect.width + 8, height: coronaH)),
+                 with: .linearGradient(
+                    Gradient(colors: [
+                        .clear,
+                        Color(red: 1.0, green: 0.45, blue: 0.05).opacity(0.18 * bright * flicker),
+                        Color(red: 1.0, green: 0.70, blue: 0.15).opacity(0.50 * bright * flicker),
+                    ]),
+                    startPoint: CGPoint(x: rect.midX, y: rect.minY - coronaH),
+                    endPoint:   CGPoint(x: rect.midX, y: rect.minY)
+                 ))
+
+        // Embers: 4 small sparks that pulse and drift upward from the fire zone.
+        let embers: [(xf: CGFloat, freq: Double, ph: Double)] = [
+            (0.18, 6.3, 0.0), (0.44, 8.5, 1.7), (0.67, 7.1, 3.1), (0.84, 5.8, 2.3),
+        ]
+        for e in embers {
+            let ex     = rect.minX + e.xf * rect.width
+            let drift  = CGFloat(now * 16.0).truncatingRemainder(dividingBy: fireH + coronaH)
+            let ey     = rect.minY + fireH * 0.3 - drift
+            guard ey >= rect.minY - coronaH - 2 else { continue }
+            let pulse  = CGFloat(0.50 + 0.50 * sin(now * e.freq + Double(seed) + e.ph))
+            let er     = CGFloat(1.3 + 0.9 * pulse)
+            let orange = CGFloat(0.40 + 0.60 * pulse)
+            ctx.fill(
+                Path(ellipseIn: CGRect(x: ex - er, y: ey - er,
+                                       width: er * 2, height: er * 2)),
+                with: .color(Color(red: 1.0, green: orange, blue: 0.10)
+                    .opacity(pulse * bright * 0.90))
+            )
+        }
+
+        // Note label when close to hit zone.
         if bright > 0.65 {
-            let names = ["G4", "B4", "D5", "G5"]
-            let label = names[min(lane, 3)]
-            let text  = Text(label)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundColor(color.opacity(bright))
-            let resolved = ctx.resolve(text)
-            let tSize    = resolved.measure(in: CGSize(width: 200, height: 40))
+            let names    = ["G4", "B4", "D5", "G5"]
+            let resolved = ctx.resolve(
+                Text(names[min(lane, 3)])
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(color.opacity(bright))
+            )
+            let tSize = resolved.measure(in: CGSize(width: 200, height: 40))
             ctx.draw(resolved,
                      at: CGPoint(x: rect.midX - tSize.width / 2,
-                                 y: rect.midY - tSize.height / 2),
+                                 y: rect.midY  - tSize.height / 2),
                      anchor: .topLeading)
         }
+    }
+
+    /// Tile path: square top corners, rounded bottom corners, and subtle
+    /// sine-wave undulation on the sides — most pronounced at the top
+    /// (fire zone) and smoothing to straight near the rounded base.
+    private func wavyTileShape(_ rect: CGRect, now: Double, seed: Int) -> Path {
+        let cornerR = min(rect.width * 0.38, 10.0)
+        let amp: CGFloat  = 2.6
+        let freq: CGFloat = 0.16
+        let phase = CGFloat(now * 2.6) + CGFloat(seed) * 0.55
+        let step: CGFloat = 5.0
+
+        var p = Path()
+        p.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+
+        // Right side — waviness fades toward the bottom corner.
+        var y = rect.minY
+        while y < rect.maxY - cornerR {
+            y = min(y + step, rect.maxY - cornerR)
+            let fade = max(0.0, 1.0 - (y - rect.minY) / (rect.height * 0.70))
+            let wave = amp * CGFloat(fade) * sin(y * freq + phase)
+            p.addLine(to: CGPoint(x: rect.maxX + wave, y: y))
+        }
+
+        // Bottom-right rounded corner.
+        p.addArc(center: CGPoint(x: rect.maxX - cornerR, y: rect.maxY - cornerR),
+                 radius: cornerR, startAngle: .degrees(0), endAngle: .degrees(90),
+                 clockwise: false)
+        p.addLine(to: CGPoint(x: rect.minX + cornerR, y: rect.maxY))
+        p.addArc(center: CGPoint(x: rect.minX + cornerR, y: rect.maxY - cornerR),
+                 radius: cornerR, startAngle: .degrees(90), endAngle: .degrees(180),
+                 clockwise: false)
+
+        // Left side — opposite phase so the two sides breathe independently.
+        y = rect.maxY - cornerR
+        while y > rect.minY {
+            y = max(y - step, rect.minY)
+            let fade = max(0.0, 1.0 - (y - rect.minY) / (rect.height * 0.70))
+            let wave = amp * CGFloat(fade) * sin(y * freq + phase + .pi * 0.65)
+            p.addLine(to: CGPoint(x: rect.minX - wave, y: y))
+        }
+
+        p.closeSubpath()
+        return p
     }
 
     private func drawHitFlash(rect: CGRect, color: Color, alpha: CGFloat,
@@ -216,6 +296,66 @@ struct UniverseTuneOverlay: View {
             endPoint:   CGPoint(x: rect.midX, y: rect.maxY)
         ))
         ctx.stroke(body, with: .color(Color.red.opacity(0.55 * alpha)), lineWidth: 1)
+    }
+
+    // MARK: - Song complete screen
+
+    @ViewBuilder
+    private var songCompleteScreen: some View {
+        ZStack {
+            Color.black.opacity(0.82).ignoresSafeArea()
+
+            VStack(spacing: 24) {
+                Text(engine.song.title.uppercased())
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.5))
+                    .tracking(6)
+
+                Text("PERFECT CLEAR")
+                    .font(.system(size: 44, weight: .black, design: .monospaced))
+                    .foregroundStyle(
+                        LinearGradient(colors: [.cyan, .purple, .pink],
+                                       startPoint: .leading, endPoint: .trailing)
+                    )
+                    .shadow(color: .cyan.opacity(0.7), radius: 20)
+                    .shadow(color: .purple.opacity(0.5), radius: 40)
+
+                Text(engine.score.formatted())
+                    .font(.system(size: 52, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .shadow(color: .cyan.opacity(0.9), radius: 14)
+
+                VStack(spacing: 6) {
+                    if engine.totalHits + engine.totalMisses > 0 {
+                        let acc = Double(engine.totalHits) /
+                                  Double(engine.totalHits + engine.totalMisses)
+                        Text(String(format: "%.0f %%  accuracy", acc * 100))
+                            .font(.system(size: 15, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.65))
+                    }
+                    Text("\(engine.totalHits) notes hit")
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+
+                HStack(spacing: 20) {
+                    Button(action: onRestart) {
+                        Label("play again", systemImage: "arrow.counterclockwise")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .controlSize(.large)
+
+                    Button(action: onExit) {
+                        Label("exit", systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
+                .padding(.top, 8)
+            }
+            .padding(48)
+        }
     }
 
     // MARK: - Game over screen
