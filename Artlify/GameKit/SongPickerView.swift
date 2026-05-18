@@ -56,7 +56,7 @@ struct SongPickerView: View {
     @ViewBuilder
     private func songCard(_ song: TileSong) -> some View {
         let isHovered = hovered == song.title
-        let accent    = song.laneColors[2]
+        let accent    = song.laneColors[song.laneColors.count / 2]
 
         Button { onSelect(song) } label: {
             VStack(alignment: .leading, spacing: 16) {
@@ -78,14 +78,14 @@ struct SongPickerView: View {
                     .foregroundStyle(.white.opacity(0.35))
 
                 HStack(spacing: 8) {
-                    ForEach(0..<4, id: \.self) { lane in
-                        VStack(spacing: 4) {
+                    ForEach(0..<song.laneNotes.count, id: \.self) { lane in
+                        VStack(spacing: 3) {
                             Circle()
                                 .fill(song.laneColors[lane])
-                                .frame(width: 10, height: 10)
-                                .shadow(color: song.laneColors[lane].opacity(0.8), radius: 4)
+                                .frame(width: 7, height: 7)
+                                .shadow(color: song.laneColors[lane].opacity(0.8), radius: 3)
                             Text(noteName(midi: song.laneNotes[lane]))
-                                .font(.system(size: 9, design: .monospaced))
+                                .font(.system(size: 7, design: .monospaced))
                                 .foregroundStyle(.white.opacity(0.55))
                         }
                     }
@@ -150,15 +150,15 @@ struct SongPickerView: View {
 
                 // Colour-wheel tile preview
                 HStack(spacing: 8) {
-                    ForEach(0..<4, id: \.self) { i in
-                        VStack(spacing: 4) {
+                    ForEach(0..<8, id: \.self) { i in
+                        VStack(spacing: 3) {
                             Circle()
-                                .fill(Color(hue: Double(i) / 4.0, saturation: 0.80, brightness: 1.0))
-                                .frame(width: 10, height: 10)
-                                .shadow(color: Color(hue: Double(i)/4.0, saturation: 0.8,
-                                                     brightness: 1.0).opacity(0.8), radius: 4)
+                                .fill(Color(hue: Double(i) / 8.0, saturation: 0.80, brightness: 1.0))
+                                .frame(width: 7, height: 7)
+                                .shadow(color: Color(hue: Double(i) / 8.0, saturation: 0.8,
+                                                     brightness: 1.0).opacity(0.8), radius: 3)
                             Text("?")
-                                .font(.system(size: 9, design: .monospaced))
+                                .font(.system(size: 7, design: .monospaced))
                                 .foregroundStyle(.white.opacity(0.40))
                         }
                     }

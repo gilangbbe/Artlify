@@ -36,17 +36,17 @@ extension TileSong {
         var beat = 0.0
         let durChoices: [Double] = [0.5, 1.0, 1.0, 1.0, 1.5, 2.0]
         while beat < totalBeats - 1.5 {
-            let lane    = Int(rng.next() % 4)
+            let lane    = Int(rng.next() % 8)
             let noteDur = durChoices[Int(rng.next() % UInt64(durChoices.count))]
             events.append(NoteEvent(beat: beat, lane: lane, duration: noteDur))
             // Gap: 0.5–1.5 beats between tile start times
             beat += 0.5 + Double(rng.next() % 4) * 0.25
         }
 
-        // 4 hues evenly spaced on the colour wheel, rotated by title hash.
+        // 8 hues evenly spaced on the colour wheel, rotated by title hash.
         let baseHue = Double((handle.title.hashValue ^ handle.artistName.hashValue) & 0xFF) / 255.0
-        let colors: [Color] = (0..<4).map { i in
-            let h = (baseHue + Double(i) / 4.0).truncatingRemainder(dividingBy: 1.0)
+        let colors: [Color] = (0..<8).map { i in
+            let h = (baseHue + Double(i) / 8.0).truncatingRemainder(dividingBy: 1.0)
             return Color(hue: h, saturation: 0.80, brightness: 1.0)
         }
 
@@ -55,7 +55,7 @@ extension TileSong {
             composer: handle.artistName,
             bpm: bpm,
             events: events.sorted { $0.beat < $1.beat },
-            laneNotes: [60, 64, 67, 72],     // C4 E4 G4 C5 — muted in Apple Music mode
+            laneNotes: [60, 62, 64, 65, 67, 69, 71, 72], // C major scale — muted in Apple Music mode
             laneColors: colors,
             appleMusicHandle: handle
         )
@@ -232,12 +232,12 @@ struct AppleMusicBrowser: View {
         } label: {
             HStack(spacing: 12) {
                 // Lane-colour preview strips
-                HStack(spacing: 3) {
-                    ForEach(0..<4, id: \.self) { i in
-                        let h = (baseHue + Double(i) / 4.0).truncatingRemainder(dividingBy: 1.0)
+                HStack(spacing: 2) {
+                    ForEach(0..<8, id: \.self) { i in
+                        let h = (baseHue + Double(i) / 8.0).truncatingRemainder(dividingBy: 1.0)
                         RoundedRectangle(cornerRadius: 2)
                             .fill(Color(hue: h, saturation: 0.80, brightness: 1.0))
-                            .frame(width: 5, height: 20)
+                            .frame(width: 3, height: 20)
                     }
                 }
 

@@ -52,16 +52,15 @@ struct UniverseTuneOverlay: View {
     // MARK: - Lane dividers
 
     private func drawLaneDividers(ctx: GraphicsContext, size: CGSize) {
-        let laneW = size.width / 4
-        for i in 1..<4 {
+        let laneW = size.width / CGFloat(engine.laneCount)
+        for i in 1..<engine.laneCount {
             var p = Path()
             let x = laneW * CGFloat(i)
             p.move(to:    CGPoint(x: x, y: 0))
             p.addLine(to: CGPoint(x: x, y: size.height))
             ctx.stroke(p, with: .color(.white.opacity(0.10)), lineWidth: 1)
         }
-        // Faint lane-column backgrounds so the playing field reads clearly
-        for lane in 0..<4 {
+        for lane in 0..<engine.laneCount {
             let color = engine.song.laneColors[lane]
             let x = laneW * CGFloat(lane)
             ctx.fill(Path(CGRect(x: x, y: 0, width: laneW, height: size.height)),
@@ -83,7 +82,7 @@ struct UniverseTuneOverlay: View {
     // MARK: - Tiles
 
     private func drawTiles(ctx: GraphicsContext, size: CGSize) {
-        let laneW = size.width / 4
+        let laneW = size.width / CGFloat(engine.laneCount)
         let st    = engine.songTime
 
         for tile in engine.activeTiles {
@@ -191,9 +190,11 @@ struct UniverseTuneOverlay: View {
 
         // Note label when close to hit zone.
         if bright > 0.65 {
-            let names    = ["G4", "B4", "D5", "G5"]
+            let midi     = engine.song.laneNotes[lane]
+            let noteNames = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+            let label    = "\(noteNames[Int(midi) % 12])\(Int(midi) / 12 - 1)"
             let resolved = ctx.resolve(
-                Text(names[min(lane, 3)])
+                Text(label)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundColor(color.opacity(bright))
             )

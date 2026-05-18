@@ -57,7 +57,7 @@ final class TileEngine {
     // ---- Constants
     let fallSpeed: Double = 0.22    // UV per second
     let hitZoneY:  Double = 0.72    // target y at note's beat time
-    let laneCount: Int    = 4
+    let laneCount: Int    = 8
 
     /// Leave false when the overlay canvas is inside a scaleEffect(x:-1)
     /// group — the tile coordinates and joint coordinates are already in
@@ -234,6 +234,19 @@ final class TileEngine {
         // Pre-compute head centre once per tick (cheaper than per-tile).
         let head = headCenter()
 
+        // Per-lane: find the ID of the bottommost (highest topY) active tile.
+        // Only that tile can be hit; tiles above it are locked until it's cleared.
+        var bottommostID: [Int: UUID] = [:]
+        for tile in activeTiles where tile.state == .active {
+            let y = tileTopY(tile)
+            if let bid = bottommostID[tile.lane] {
+                let curY = activeTiles.first(where: { $0.id == bid }).map { tileTopY($0) } ?? -1
+                if y > curY { bottommostID[tile.lane] = tile.id }
+            } else {
+                bottommostID[tile.lane] = tile.id
+            }
+        }
+
         for i in activeTiles.indices where activeTiles[i].state == .active {
             let topY   = tileTopY(activeTiles[i])
             let height = tileHeight(activeTiles[i])
@@ -249,6 +262,9 @@ final class TileEngine {
                 isGameOver = true
                 return   // stop processing remaining tiles this tick
             }
+
+            // Only the bottommost tile in this lane can be hit.
+            guard bottommostID[lane] == activeTiles[i].id else { continue }
 
             let laneMinX = Double(lane) * laneW
             let laneMaxX = laneMinX + laneW
