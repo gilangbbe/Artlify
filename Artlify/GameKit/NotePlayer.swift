@@ -26,6 +26,7 @@ final class NotePlayer {
     private let reverb  = AVAudioUnitReverb()
 
     private(set) var isReady = false
+    var isMuted: Bool = false
 
     init(song: TileSong) {
         self.laneNotes = song.laneNotes
@@ -83,7 +84,7 @@ final class NotePlayer {
     }
 
     private func trigger(lane: Int, velocity: UInt8, sustainSeconds: Double) {
-        guard isReady, lane >= 0, lane < laneNotes.count else { return }
+        guard isReady, !isMuted, lane >= 0, lane < laneNotes.count else { return }
         let note = laneNotes[lane]
         sampler.startNote(note, withVelocity: velocity, onChannel: 0)
         DispatchQueue.main.asyncAfter(deadline: .now() + sustainSeconds) { [weak self] in

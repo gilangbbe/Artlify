@@ -117,6 +117,12 @@ final class TileEngine {
 
     func reset() { stop(); start() }
 
+    /// Silence all NotePlayer output — used when an Apple Music song
+    /// provides the audio and the built-in piano tones should not play.
+    func muteNotes(_ muted: Bool) {
+        notePlayer.isMuted = muted
+    }
+
     // MARK: - Per-frame update (60 Hz from ContentView timer)
 
     /// `joints` must be in UV top-left coords: x ∈ [0,1] left→right,

@@ -269,6 +269,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Artlify searches Apple Music to generate a tile game from any song in the catalog.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Artlify uses the camera (including your iPhone via Continuity Camera) to generate live AI artwork.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Artlify listens to ambient sound to modulate the particle field in real time.";
@@ -305,6 +306,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSAppleMusicUsageDescription = "Artlify searches Apple Music to generate a tile game from any song in the catalog.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Artlify uses the camera (including your iPhone via Continuity Camera) to generate live AI artwork.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Artlify listens to ambient sound to modulate the particle field in real time.";

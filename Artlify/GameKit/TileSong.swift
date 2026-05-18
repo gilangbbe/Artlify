@@ -21,6 +21,14 @@ struct NoteEvent: Identifiable {
     let duration: Double
 }
 
+// Plain handle — no MusicKit import required here.
+struct AppleMusicHandle {
+    let musicItemID: String
+    let title: String
+    let artistName: String
+    let duration: TimeInterval?    // nil when unknown
+}
+
 struct TileSong {
     let title: String
     let composer: String
@@ -31,6 +39,21 @@ struct TileSong {
     let laneNotes: [UInt8]
     /// UI accent colour per lane (4 values).
     let laneColors: [Color]
+
+    /// Non-nil when this song is backed by an Apple Music catalog track.
+    var appleMusicHandle: AppleMusicHandle? = nil
+
+    init(title: String, composer: String, bpm: Double, events: [NoteEvent],
+         laneNotes: [UInt8], laneColors: [Color],
+         appleMusicHandle: AppleMusicHandle? = nil) {
+        self.title            = title
+        self.composer         = composer
+        self.bpm              = bpm
+        self.events           = events
+        self.laneNotes        = laneNotes
+        self.laneColors       = laneColors
+        self.appleMusicHandle = appleMusicHandle
+    }
 
     var beatDuration: Double { 60.0 / bpm }
 

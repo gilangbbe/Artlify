@@ -17,6 +17,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import MusicKit
 
 struct ContentView: View {
     @State private var session = CameraSession()
@@ -41,6 +42,8 @@ struct ContentView: View {
     @State private var gameEngine: TileEngine?
     @State private var gameModeOn: Bool = false
     @State private var showSongPicker: Bool = false
+    @State private var showAppleBrowser: Bool = false
+    @State private var activeAppleMusicHandle: AppleMusicHandle? = nil
     @State private var mirrorEnabled: Bool = true
     @State private var gameTimer = Timer.publish(every: 1.0 / 60.0, on: .main,
                                                  in: .common).autoconnect()
@@ -81,6 +84,9 @@ struct ContentView: View {
                             onRestart: {
                                 engine.stop()
                                 engine.start()
+                                if let handle = activeAppleMusicHandle {
+                                    Task { await playAppleMusicInApp(handle: handle) }
+                                }
                             },
                             onExit: { stopGame() }
                         )
@@ -121,6 +127,24 @@ struct ContentView: View {
                     },
                     onCancel: {
                         showSongPicker = false
+                    },
+                    onOpenAppleMusic: {
+                        showAppleBrowser = true
+                    }
+                )
+                .ignoresSafeArea()
+            }
+
+            // Apple Music browser (stacks on top of song picker)
+            if showAppleBrowser {
+                AppleMusicBrowser(
+                    onSelect: { song in
+                        showAppleBrowser = false
+                        showSongPicker   = false
+                        startGame(song: song)
+                    },
+                    onCancel: {
+                        showAppleBrowser = false
                     }
                 )
                 .ignoresSafeArea()
@@ -684,10 +708,16 @@ struct ContentView: View {
 
     private func startGame(song: TileSong) {
         let engine = TileEngine(song: song)
+        engine.muteNotes(song.appleMusicHandle != nil)
         engine.start()
-        gameEngine = engine
-        gameModeOn = true
-        showHUD    = false   // press H to peek at HUD during play
+        gameEngine  = engine
+        gameModeOn  = true
+        showHUD     = false   // press H to peek at HUD during play
+
+        if let handle = song.appleMusicHandle {
+            activeAppleMusicHandle = handle
+            Task { await playAppleMusicInApp(handle: handle) }
+        }
     }
 
     private func stopGame() {
@@ -695,6 +725,28 @@ struct ContentView: View {
         gameEngine  = nil
         gameModeOn  = false
         showHUD     = true
+
+        if activeAppleMusicHandle != nil {
+            activeAppleMusicHandle = nil
+            ApplicationMusicPlayer.shared.stop()
+        }
+    }
+
+    private func playAppleMusicInApp(handle: AppleMusicHandle) async {
+        do {
+            var req = MusicCatalogSearchRequest(
+                term: "\(handle.title) \(handle.artistName)", types: [Song.self])
+            req.limit = 5
+            let resp = try await req.response()
+            guard let song = resp.songs.first(where: { $0.id.rawValue == handle.musicItemID })
+                          ?? resp.songs.first
+            else { return }
+            let player = ApplicationMusicPlayer.shared
+            player.queue = [song]
+            try await player.play()
+        } catch {
+            print("Apple Music playback: \(error)")
+        }
     }
 
     /// Map a single hue slider into the ASCII shader's two tint colours
