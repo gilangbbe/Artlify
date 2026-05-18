@@ -37,26 +37,85 @@ struct ContentView: View {
     @State private var blobsStrings: Bool = true
     @State private var asciiHue: Double = 0.33   // green default
 
+    // Universe Tune game
+    @State private var gameEngine: TileEngine?
+    @State private var gameModeOn: Bool = false
+    @State private var showSongPicker: Bool = false
+    @State private var mirrorEnabled: Bool = true
+    @State private var gameTimer = Timer.publish(every: 1.0 / 60.0, on: .main,
+                                                 in: .common).autoconnect()
+
     var body: some View {
         ZStack(alignment: .topLeading) {
-            CameraMetalView(renderer: session.renderer)
-                .ignoresSafeArea()
 
-            if blobsEnabled {
-                GeometryReader { proxy in
-                    BlobBoxesOverlay(store: blobs,
-                                     intensity: blobsIntensity,
-                                     drawStrings: blobsStrings)
-                        .frame(width: proxy.size.width, height: proxy.size.height)
+            // ── Scene layers (camera + overlays) ──────────────────────────
+            // Wrapped together so a single scaleEffect mirrors everything
+            // uniformly. Text HUD sits outside and stays readable.
+            ZStack {
+                CameraMetalView(renderer: session.renderer)
+                    .ignoresSafeArea()
+
+                if blobsEnabled {
+                    GeometryReader { proxy in
+                        BlobBoxesOverlay(store: blobs,
+                                         intensity: blobsIntensity,
+                                         drawStrings: blobsStrings)
+                            .frame(width: proxy.size.width, height: proxy.size.height)
+                    }
+                    .ignoresSafeArea()
                 }
-                .ignoresSafeArea()
+
+                if showVisionOverlay {
+                    GeometryReader { proxy in
+                        PoseOverlay(frame: vision.latestFrame, viewSize: proxy.size)
+                            .allowsHitTesting(false)
+                    }
+                    .ignoresSafeArea()
+                }
+
+                // Universe Tune game tiles overlay
+                if gameModeOn, let engine = gameEngine {
+                    GeometryReader { proxy in
+                        UniverseTuneOverlay(engine: engine)
+                            .frame(width: proxy.size.width, height: proxy.size.height)
+                    }
+                    .ignoresSafeArea()
+                }
+            }
+            // Mirror: flip x so the display feels like looking in a mirror.
+            // Text overlays sit outside this group and are unaffected.
+            .scaleEffect(x: mirrorEnabled ? -1 : 1, y: 1)
+            .ignoresSafeArea()
+
+            // ── Non-mirrored UI layers ─────────────────────────────────────
+
+            // Exit-game button (top-right)
+            if gameModeOn {
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button { stopGame() } label: {
+                            Label("exit tune", systemImage: "xmark.circle")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .padding(12)
+                    }
+                    Spacer()
+                }
             }
 
-            if showVisionOverlay {
-                GeometryReader { proxy in
-                    PoseOverlay(frame: vision.latestFrame, viewSize: proxy.size)
-                        .allowsHitTesting(false)
-                }
+            // Song picker (before game starts)
+            if showSongPicker {
+                SongPickerView(
+                    onSelect: { song in
+                        showSongPicker = false
+                        startGame(song: song)
+                    },
+                    onCancel: {
+                        showSongPicker = false
+                    }
+                )
                 .ignoresSafeArea()
             }
 
@@ -97,6 +156,7 @@ struct ContentView: View {
             audio.stop()
             vision.stop()
             session.stop()
+            gameEngine?.stop()
         }
         // Push the latest segmentation mask into the renderer whenever
         // VisionSession publishes a new frame. The particle compute
@@ -113,6 +173,18 @@ struct ContentView: View {
             // Push fresh joint samples into the blob-box store so
             // each tracked body point's bounding box follows the body.
             updateBlobs()
+        }
+        // Keep mirror flag in sync if the user toggles it mid-game.
+        .onChange(of: mirrorEnabled) { _, newVal in
+            gameEngine?.isMirrored = newVal
+        }
+        // Universe Tune: drive the tile engine at 60 Hz.
+        // Joint data is read from vision.latestFrame — stale between
+        // Vision passes (~15 Hz) but the tile physics still advance
+        // smoothly every frame.
+        .onReceive(gameTimer) { _ in
+            guard gameModeOn else { return }
+            gameEngine?.update(joints: vision.latestFrame?.joints ?? [])
         }
         // Periodically flash 1–3 negative-camera boxes around random
         // body joints. Empty frames (no joints) are silently skipped.
@@ -175,6 +247,26 @@ struct ContentView: View {
                     Label("Fullscreen", systemImage: "arrow.up.left.and.arrow.down.right")
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.small)
+                // Universe Tune game toggle
+                Button {
+                    if gameModeOn {
+                        stopGame()
+                    } else {
+                        showSongPicker = true
+                    }
+                } label: {
+                    Label(gameModeOn ? "stop tune" : "universe tune",
+                          systemImage: gameModeOn ? "stop.circle" : "pianokeys")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(gameModeOn ? .red : .indigo)
+                .controlSize(.small)
+                // Mirror toggle
+                Toggle(isOn: $mirrorEnabled) {
+                    Label("mirror", systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right")
+                }
+                .toggleStyle(.button)
                 .controlSize(.small)
             }
         }
@@ -579,6 +671,24 @@ struct ContentView: View {
             }
         blobs.updatePositions(joints: samples,
                               now: CFAbsoluteTime(f.timestamp))
+    }
+
+    // MARK: - Universe Tune game
+
+    private func startGame(song: TileSong) {
+        let engine = TileEngine(song: song)
+        engine.isMirrored = mirrorEnabled
+        engine.start()
+        gameEngine = engine
+        gameModeOn = true
+        showHUD    = false   // press H to peek at HUD during play
+    }
+
+    private func stopGame() {
+        gameEngine?.stop()
+        gameEngine  = nil
+        gameModeOn  = false
+        showHUD     = true
     }
 
     /// Map a single hue slider into the ASCII shader's two tint colours
