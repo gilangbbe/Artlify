@@ -101,7 +101,7 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     /// re-rendered as a grid of glyphs (sparse → dense by luminance).
     /// An audio-triggered ring expands outward from `asciiOrigin`,
     /// briefly densifying glyphs as it crosses them.
-    public var asciiEnabled: Bool = false
+    public var asciiEnabled: Bool = true
     /// Glyph cell edge in pixels. Smaller = more detail, less ASCII feel.
     public var asciiCellSize: Float = 12.0
     /// Body-anchored origin for the audio shockwave ring (uv).

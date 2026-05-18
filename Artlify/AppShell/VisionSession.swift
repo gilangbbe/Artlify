@@ -32,8 +32,10 @@ final class VisionSession {
     private let log = Logger(subsystem: "com.biru.Artlify", category: "AppShell")
     private let processor = VisionProcessor()
 
-    /// Target processing cadence. Default 15 Hz.
-    var targetHz: Double = 15.0
+    /// Target processing cadence. Default 30 Hz.
+    /// (Raised from 15 Hz — diffusion pipeline no longer shares the ANE budget
+    /// on this branch, so Vision can safely use more throughput.)
+    var targetHz: Double = 30.0
 
     private(set) var status: Status = .idle
     private(set) var latestFrame: VisionFrame?

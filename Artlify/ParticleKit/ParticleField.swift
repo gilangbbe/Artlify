@@ -66,11 +66,11 @@ public final class ParticleField {
     /// Pull strength toward the silhouette gradient (into the body).
     public var attraction: Float  = 1.6
     /// Velocity damping each step. Closer to 1 = longer trails.
-    public var damping: Float     = 0.92
+    public var damping: Float     = 0.923
     /// Curl-noise flow magnitude — the "fluid" feel.
-    public var flow: Float        = 0.45
+    public var flow: Float        = 1.47
     /// Spatial frequency of the curl noise. Higher = tighter swirls.
-    public var flowScale: Float   = 6.0
+    public var flowScale: Float   = 7.5
     /// 0 = particles visible everywhere, 1 = only inside silhouette.
     public var maskGate: Float    = 1.0
     /// Sprite size in pixels.
@@ -93,7 +93,7 @@ public final class ParticleField {
     public var bodyCenter: SIMD2<Float> = SIMD2<Float>(0.5, 0.5)
 
     /// Number of live particles. Changing this rebuilds the buffer.
-    public var count: Int = 30_000 {
+    public var count: Int = 60_000 {
         didSet {
             if oldValue != count {
                 rebuildBuffer()

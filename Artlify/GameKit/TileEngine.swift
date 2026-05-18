@@ -50,6 +50,7 @@ final class TileEngine {
     private(set) var totalMisses: Int = 0
     private(set) var songTime: Double = 0
     private(set) var isPlaying: Bool = false
+    private(set) var isGameOver: Bool = false
 
     // ---- Constants
     let fallSpeed: Double = 0.22    // UV per second
@@ -69,6 +70,13 @@ final class TileEngine {
     private var loopOffset: Double = 0     // running beat offset across loops
     private var nextEventIdx: Int = 0
 
+    // Joint interpolation: store two consecutive Vision snapshots so we can
+    // LERP body positions at 60 Hz even when Vision fires at ~30 Hz.
+    private var prevJoints: [VisionJoint] = []
+    private var currJoints: [VisionJoint] = []
+    private var prevJointTime: Double = 0
+    private var currJointTime: Double = 0
+
     // Lead time before tile should hit hitZoneY; tile enters at y = spawnLeadY
     private let spawnLeadY: Double = -0.06
     private var spawnLeadTime: Double { (hitZoneY - spawnLeadY) / fallSpeed }
@@ -83,11 +91,18 @@ final class TileEngine {
     func start() {
         guard !isPlaying else { return }
         isPlaying  = true
-        startTime  = CFAbsoluteTimeGetCurrent()
+        isGameOver = false
+        // Offset startTime into the future by spawnLeadTime so songTime
+        // begins at -spawnLeadTime. The first beat-0 tile then spawns
+        // immediately but at y = spawnLeadY (off-screen top) and falls
+        // into view naturally, rather than appearing at hitZoneY.
+        startTime  = CFAbsoluteTimeGetCurrent() + spawnLeadTime
         loopOffset = 0
         nextEventIdx = 0
         activeTiles = []
         score = 0; combo = 0; totalHits = 0; totalMisses = 0
+        prevJoints = []; currJoints = []
+        prevJointTime = 0; currJointTime = 0
     }
 
     func stop() {
@@ -102,12 +117,22 @@ final class TileEngine {
 
     /// `joints` must be in UV top-left coords: x ∈ [0,1] left→right,
     /// y ∈ [0,1] top→bottom (Vision's y already flipped by caller).
-    func update(joints: [VisionJoint]) {
-        guard isPlaying else { return }
+    /// `jointTimestamp` is the CFAbsoluteTime of the Vision frame that
+    /// produced `joints`; used to LERP positions between Vision frames.
+    func update(joints: [VisionJoint], jointTimestamp: CFAbsoluteTime = 0) {
+        guard isPlaying, !isGameOver else { return }
         songTime = CFAbsoluteTimeGetCurrent() - startTime
 
+        // Detect a fresh Vision frame by comparing its absolute timestamp.
+        if jointTimestamp > currJointTime + 0.001 {
+            prevJoints    = currJoints
+            prevJointTime = currJointTime
+            currJoints    = joints
+            currJointTime = jointTimestamp
+        }
+
         spawnTiles()
-        processCollisions(joints: joints)
+        processCollisions()
         pruneTiles()
         advanceLoop()
     }
@@ -141,7 +166,38 @@ final class TileEngine {
         }
     }
 
-    private func processCollisions(joints: [VisionJoint]) {
+    /// Returns interpolated (x, y) in UV top-left coords for a joint,
+    /// blending between the two most recent Vision snapshots so that
+    /// body position tracks smoothly at 60 Hz even when Vision fires
+    /// at ~30 Hz.  Falls back to the raw position when no prev snapshot
+    /// exists yet.
+    private func interpolatedPosition(for joint: VisionJoint) -> (x: Double, y: Double) {
+        let rawX = Double(joint.point.x)
+        let rawY = 1.0 - Double(joint.point.y)   // Vision bottom-left → UV top-left
+
+        guard !prevJoints.isEmpty,
+              currJointTime > prevJointTime + 0.001
+        else { return (rawX, rawY) }
+
+        // Find the matching joint in the previous snapshot by ID.
+        guard let prev = prevJoints.first(where: { $0.id == joint.id }) else {
+            return (rawX, rawY)
+        }
+
+        let span = currJointTime - prevJointTime
+        let now  = CFAbsoluteTimeGetCurrent()
+        // How far past currJointTime are we? Clamp [0,1] so we don't
+        // extrapolate beyond the next expected Vision frame.
+        let alpha = min(1.0, max(0.0, (now - currJointTime) / span))
+
+        let prevX = Double(prev.point.x)
+        let prevY = 1.0 - Double(prev.point.y)
+
+        return (prevX + (rawX - prevX) * alpha,
+                prevY + (rawY - prevY) * alpha)
+    }
+
+    private func processCollisions() {
         let laneW = 1.0 / Double(laneCount)
 
         for i in activeTiles.indices where activeTiles[i].state == .active {
@@ -149,32 +205,33 @@ final class TileEngine {
             let height = tileHeight(activeTiles[i])
             let lane   = activeTiles[i].lane
 
-            // Miss: leading edge past bottom
+            // Miss: leading edge past bottom → game over
             if topY > 1.04 {
-                activeTiles[i].state     = .missed
+                activeTiles[i].state      = .missed
                 activeTiles[i].missedTime = songTime
                 combo = 0
                 totalMisses += 1
                 notePlayer.playGhost(lane: lane)
-                continue
+                isGameOver = true
+                return   // stop processing remaining tiles this tick
             }
 
-            // Hit: any confident joint inside the tile rect
+            // Hit: any confident joint inside the tile rect (interpolated position)
             let laneMinX = Double(lane) * laneW
             let laneMaxX = laneMinX + laneW
 
-            for joint in joints where joint.confidence >= 0.30 {
+            for joint in currJoints where joint.confidence >= 0.30 {
+                let (rawJx, jy) = interpolatedPosition(for: joint)
                 // Flip x when mirrored so lane checks match the visual display.
-                let jx = isMirrored ? 1.0 - Double(joint.point.x) : Double(joint.point.x)
-                let jy = 1.0 - Double(joint.point.y)   // Vision y → top-left UV y
+                let jx = isMirrored ? 1.0 - rawJx : rawJx
 
                 guard jx >= laneMinX, jx <= laneMaxX,
                       jy >= topY,     jy <= topY + height
                 else { continue }
 
                 // Timing accuracy: how close to the "perfect" beat moment
-                let timingErr = abs(songTime - activeTiles[i].absoluteTargetTime)
-                let accuracy  = max(0.3, 1.0 - timingErr * 1.2)
+                let timingErr  = abs(songTime - activeTiles[i].absoluteTargetTime)
+                let accuracy   = max(0.3, 1.0 - timingErr * 1.2)
                 let comboBonus = min(combo / 5, 8)
                 let pts = Int(Double(100) * accuracy) * (1 + comboBonus)
 

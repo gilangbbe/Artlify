@@ -16,6 +16,8 @@ import Combine
 
 struct UniverseTuneOverlay: View {
     let engine: TileEngine
+    var onRestart: () -> Void = {}
+    var onExit:    () -> Void = {}
 
     private let timer = Timer.publish(every: 1.0 / 60.0,
                                       on: .main, in: .common).autoconnect()
@@ -26,13 +28,16 @@ struct UniverseTuneOverlay: View {
             Canvas { ctx, size in
                 let _ = now   // captures now so timer forces redraws
                 drawLaneDividers(ctx: ctx, size: size)
-                drawHitZoneLine(ctx:  ctx, size: size)
                 drawTiles(ctx: ctx, size: size)
             }
             .allowsHitTesting(false)
             .drawingGroup()
 
-            scoreHUD
+            if engine.isGameOver {
+                gameOverScreen
+            } else {
+                scoreHUD
+            }
         }
         .onReceive(timer) { _ in now = CFAbsoluteTimeGetCurrent() }
     }
@@ -124,7 +129,7 @@ struct UniverseTuneOverlay: View {
         // Crisp inner border
         ctx.stroke(path, with: .color(color.opacity(0.90 * bright)), lineWidth: 1.5)
 
-        // Corner tick brackets — same idiom as BlobBoxes
+        // Corner tick brackets
         let tick = max(6, min(rect.width, rect.height) * 0.22)
         var ticks = Path()
         // Top-left
@@ -163,20 +168,98 @@ struct UniverseTuneOverlay: View {
 
     private func drawHitFlash(rect: CGRect, color: Color, alpha: CGFloat,
                               ctx: GraphicsContext) {
-        // Tile expands outward as it fades, like an explosion ring
-        let expansion = (1.0 - alpha) * rect.width * 0.45
-        let expanded  = rect.insetBy(dx: -expansion, dy: -expansion * 0.5)
-        let path      = Path(expanded)
-        ctx.fill(path,   with: .color(color.opacity(0.55 * alpha)))
-        ctx.stroke(path, with: .color(.white.opacity(0.90 * alpha)), lineWidth: 2)
-        ctx.stroke(path, with: .color(color.opacity(0.40 * alpha)), lineWidth: 10)
+        // Meteor impact: expanding elliptical shock ring centred on the head
+        let impact  = CGPoint(x: rect.midX, y: rect.maxY)
+        let baseR   = rect.width * 0.55
+        let spread  = (1.0 - alpha) * rect.width * 0.90
+
+        // Outer expanding ring
+        let outerR = baseR + spread
+        let outer  = Path(ellipseIn: CGRect(x: impact.x - outerR,
+                                             y: impact.y - outerR * 0.55,
+                                             width: outerR * 2, height: outerR * 1.1))
+        ctx.stroke(outer, with: .color(color.opacity(0.70 * alpha)), lineWidth: 2)
+        ctx.stroke(outer, with: .color(.white.opacity(0.35 * alpha)), lineWidth: 1)
+
+        // Inner fill burst
+        let innerR = baseR * 0.55 + spread * 0.35
+        let inner  = Path(ellipseIn: CGRect(x: impact.x - innerR,
+                                             y: impact.y - innerR * 0.65,
+                                             width: innerR * 2, height: innerR * 1.3))
+        ctx.fill(inner, with: .color(color.opacity(0.50 * alpha)))
+        ctx.fill(inner, with: .color(.white.opacity(0.30 * alpha)))
+
+        // White-hot flash at point of impact
+        let flashR = baseR * 0.20 * alpha
+        ctx.fill(Path(ellipseIn: CGRect(x: impact.x - flashR, y: impact.y - flashR * 0.6,
+                                         width: flashR * 2, height: flashR * 1.2)),
+                 with: .color(.white.opacity(alpha)))
     }
 
     private func drawMissedTile(rect: CGRect, alpha: CGFloat, ctx: GraphicsContext) {
-        let path = Path(rect)
-        ctx.fill(path,   with: .color(.red.opacity(0.18 * alpha)))
-        ctx.stroke(path, with: .color(.red.opacity(0.65 * alpha)), lineWidth: 1.5)
-        ctx.stroke(path, with: .color(.red.opacity(0.15 * alpha)), lineWidth: 6)
+        // Burned-out meteor: dark red tapering body, dissolving downward
+        let halfW = rect.width / 2
+        var body  = Path()
+        body.move(to:    CGPoint(x: rect.midX - 3, y: rect.minY))
+        body.addLine(to: CGPoint(x: rect.midX + 3, y: rect.minY))
+        body.addLine(to: CGPoint(x: rect.midX + halfW - 2, y: rect.maxY))
+        body.addLine(to: CGPoint(x: rect.midX - halfW + 2, y: rect.maxY))
+        body.closeSubpath()
+
+        ctx.fill(body, with: .linearGradient(
+            Gradient(colors: [.clear, Color.red.opacity(0.40 * alpha)]),
+            startPoint: CGPoint(x: rect.midX, y: rect.minY),
+            endPoint:   CGPoint(x: rect.midX, y: rect.maxY)
+        ))
+        ctx.stroke(body, with: .color(Color.red.opacity(0.55 * alpha)), lineWidth: 1)
+    }
+
+    // MARK: - Game over screen
+
+    @ViewBuilder
+    private var gameOverScreen: some View {
+        ZStack {
+            Color.black.opacity(0.72)
+                .ignoresSafeArea()
+
+            VStack(spacing: 20) {
+                Text("GAME OVER")
+                    .font(.system(size: 48, weight: .black, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .shadow(color: .red.opacity(0.85), radius: 18)
+                    .shadow(color: .red.opacity(0.40), radius: 40)
+
+                Text(engine.score.formatted())
+                    .font(.system(size: 36, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .shadow(color: .cyan.opacity(0.7), radius: 10)
+
+                if engine.totalHits + engine.totalMisses > 0 {
+                    let acc = Double(engine.totalHits) /
+                              Double(engine.totalHits + engine.totalMisses)
+                    Text(String(format: "%.0f %%  accuracy", acc * 100))
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+
+                HStack(spacing: 20) {
+                    Button(action: onRestart) {
+                        Label("restart", systemImage: "arrow.counterclockwise")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.indigo)
+                    .controlSize(.large)
+
+                    Button(action: onExit) {
+                        Label("exit", systemImage: "xmark.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
+                .padding(.top, 8)
+            }
+            .padding(40)
+        }
     }
 
     // MARK: - Score HUD

@@ -76,8 +76,15 @@ struct ContentView: View {
                 // Universe Tune game tiles overlay
                 if gameModeOn, let engine = gameEngine {
                     GeometryReader { proxy in
-                        UniverseTuneOverlay(engine: engine)
-                            .frame(width: proxy.size.width, height: proxy.size.height)
+                        UniverseTuneOverlay(
+                            engine: engine,
+                            onRestart: {
+                                engine.stop()
+                                engine.start()
+                            },
+                            onExit: { stopGame() }
+                        )
+                        .frame(width: proxy.size.width, height: proxy.size.height)
                     }
                     .ignoresSafeArea()
                 }
@@ -184,7 +191,8 @@ struct ContentView: View {
         // smoothly every frame.
         .onReceive(gameTimer) { _ in
             guard gameModeOn else { return }
-            gameEngine?.update(joints: vision.latestFrame?.joints ?? [])
+            gameEngine?.update(joints: vision.latestFrame?.joints ?? [],
+                               jointTimestamp: vision.latestFrame?.timestamp ?? 0)
         }
         // Periodically flash 1–3 negative-camera boxes around random
         // body joints. Empty frames (no joints) are silently skipped.
