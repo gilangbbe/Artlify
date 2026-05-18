@@ -23,6 +23,16 @@ struct ContentView: View {
     @State private var vision = VisionSession()
     @State private var field: ParticleField?
     @State private var audio = AudioReactor()
+    /// Local audio file player. When a file is loaded, it owns the
+    /// karaoke timeline (sample-accurate) and feeds the reactor
+    /// directly, bypassing mic / SCK.
+    @State private var audioFile = AudioFilePlayer()
+    /// Apple Music driver. When `musicKit.isActive` is true, it owns
+    /// the karaoke timeline (`musicKit.currentTime` is polled from
+    /// `ApplicationMusicPlayer.shared.playbackTime`). Audio analysis
+    /// still comes from the mic listening to the speakers —
+    /// `ApplicationMusicPlayer` doesn't expose buffers to our process.
+    @State private var musicKit = MusicKitPlayer()
     @State private var showVisionOverlay = false
     @State private var showHUD = true
     /// Drives the random negative-camera flashes around body parts.
@@ -35,6 +45,27 @@ struct ContentView: View {
     @State private var blobsEnabled: Bool = true
     @State private var blobsIntensity: Double = 1.0
     @State private var blobsStrings: Bool = true
+    @State private var karaoke = KaraokeStore()
+    @State private var karaokeEnabled: Bool = false
+    @State private var karaokePlaying: Bool = false
+    /// Wall-clock time of the last karaoke advance tick, used to
+    /// integrate `karaoke.currentTime` at 1× between repaints.
+    @State private var karaokeLastTick: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    /// 60 Hz clock for advancing the karaoke playhead. Independent of
+    /// the Vision / Metal clocks so the lyric scrub stays smooth even
+    /// when the camera pipeline hiccups.
+    @State private var karaokeTimer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
+    /// Phase 2: head-tethered lyric blob. Independent toggle from the
+    /// main karaoke overlay so the user can pick fixed (bottom)
+    /// karaoke, head-anchored karaoke, or both at once.
+    @State private var headBlobEnabled: Bool = false
+    /// Phase 2 UI slice: music search sheet. Opens from the karaoke
+    /// row. Backed by `MockMusicCatalog` until LRCLIB lands.
+    @State private var showMusicSearch: Bool = false
+    /// Title of the currently-loaded track, surfaced in the HUD as a
+    /// "now playing" caption so the user can tell *what* the karaoke
+    /// engine is scrubbing through.
+    @State private var currentTrackTitle: String? = nil
     @State private var asciiHue: Double = 0.33   // green default
 
     var body: some View {
@@ -47,6 +78,33 @@ struct ContentView: View {
                     BlobBoxesOverlay(store: blobs,
                                      intensity: blobsIntensity,
                                      drawStrings: blobsStrings)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                }
+                .ignoresSafeArea()
+            }
+
+            if karaokeEnabled {
+                GeometryReader { proxy in
+                    KaraokeOverlay(store: karaoke,
+                                   audioLevel: Double(audio.latest.level),
+                                   audioLow: Double(audio.latest.low),
+                                   audioMid: Double(audio.latest.mid),
+                                   audioHigh: Double(audio.latest.high),
+                                   audioTransient: Double(audio.latest.transient))
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                }
+                .ignoresSafeArea()
+            }
+
+            if headBlobEnabled {
+                GeometryReader { proxy in
+                    HeadLyricBlob(store: karaoke,
+                                  frame: vision.latestFrame,
+                                  audioLevel: Double(audio.latest.level),
+                                  audioLow: Double(audio.latest.low),
+                                  audioMid: Double(audio.latest.mid),
+                                  audioHigh: Double(audio.latest.high),
+                                  audioTransient: Double(audio.latest.transient))
                         .frame(width: proxy.size.width, height: proxy.size.height)
                 }
                 .ignoresSafeArea()
@@ -79,6 +137,20 @@ struct ContentView: View {
             session.start()
             vision.start(consuming: session)
 
+            // Wire the file player's tap into the reactor's analysis
+            // pipeline. Always-on hook — the reactor's `ingest` no-ops
+            // unless its source is `.audioFile`, so it's safe to leave
+            // connected even when the user's listening to mic / SCK.
+            audioFile.onAudioBuffer = { [audio] buffer in
+                audio.ingest(buffer: buffer)
+            }
+            audioFile.onFinished = {
+                // Karaoke caught up to end-of-track; flip transport
+                // state so the HUD reads paused instead of "playing"
+                // forever after the last frame drains.
+                karaokePlaying = false
+            }
+
             // Build the particle field on the renderer's device and hand
             // it to the renderer so the draw callback can advance + draw
             // particles every frame.
@@ -94,6 +166,8 @@ struct ContentView: View {
             }
         }
         .onDisappear {
+            musicKit.stop()
+            audioFile.stop()
             audio.stop()
             vision.stop()
             session.stop()
@@ -123,10 +197,104 @@ struct ContentView: View {
                 blobs.tickFlash(now: CFAbsoluteTimeGetCurrent())
             }
         }
+        // Advance the karaoke playhead at 1× when playing. Driven by
+        // wall-clock deltas so pauses / drops don't desync the lyrics.
+        .onReceive(karaokeTimer) { _ in
+            let now = CFAbsoluteTimeGetCurrent()
+            let dt = now - karaokeLastTick
+            karaokeLastTick = now
+            guard karaokeEnabled else { return }
+            // Priority order for who owns the timeline:
+            //   1. MusicKit  (Apple Music — polled from daemon)
+            //   2. AudioFile (local file — sample-accurate)
+            //   3. Wall-clock integrator (sample LRC / demo rows)
+            if musicKit.isActive {
+                // Track may be nil (song without LRC). Clamp only
+                // when we have a track, otherwise let the playhead
+                // run freely so the timecode still ticks for visitors.
+                if let track = karaoke.track {
+                    karaoke.currentTime = min(musicKit.currentTime, track.duration)
+                } else {
+                    karaoke.currentTime = musicKit.currentTime
+                }
+                // Mirror transport so the HUD play/pause icon tracks
+                // what the system player is actually doing.
+                if karaokePlaying != musicKit.isPlaying {
+                    karaokePlaying = musicKit.isPlaying
+                }
+                return
+            }
+            guard karaoke.track != nil else { return }
+            // If a local file is loaded, the player owns time —
+            // sample-accurate, immune to drift / pauses / seeks. Just
+            // mirror its `currentTime` into the karaoke store.
+            if audioFile.fileURL != nil {
+                karaoke.currentTime = min(audioFile.currentTime,
+                                          karaoke.track!.duration)
+            } else if karaokePlaying {
+                karaoke.currentTime = min(karaoke.currentTime + dt,
+                                          karaoke.track!.duration)
+            }
+        }
         // Keyboard: H toggles the HUD for clean recordings.
         .background(KeyHandler { key in
             if key.lowercased() == "h" { showHUD.toggle() }
         })
+        // Music search sheet (phase 2 UI slice). Mock catalog today;
+        // swaps to MusicCatalogSearchRequest + LRCLIB later without
+        // touching this presentation.
+        .sheet(isPresented: $showMusicSearch) {
+            MusicSearchSheet(
+                onSelect: { result in
+                    switch result.kind {
+                    case .demo, .lrclib:
+                        // Stop any Apple Music playback first so the
+                        // user doesn't hear two sources fighting.
+                        musicKit.stop()
+                        karaoke.track = LRCParser.parse(result.lrc)
+                        karaoke.currentTime = 0
+                        currentTrackTitle = result.title
+                        karaokeEnabled = true
+                        karaokePlaying = true
+                        karaokeLastTick = CFAbsoluteTimeGetCurrent()
+                    case .appleMusic(let song):
+                        // Switch ownership: stop local file player so
+                        // we don't get two audio sources mixing.
+                        audioFile.stop()
+                        // Make sure the mic is running — analysis path
+                        // for ApplicationMusicPlayer is "listen to the
+                        // speakers" since the daemon doesn't expose
+                        // buffers to our process.
+                        if audio.source != .microphone {
+                            audio.switchSource(.microphone)
+                        }
+                        if !audio.isRunning { audio.start() }
+                        currentTrackTitle = result.title
+                        karaokeEnabled = true
+                        karaokePlaying = true
+                        karaokeLastTick = CFAbsoluteTimeGetCurrent()
+                        // Optimistically clear any previous lyrics so
+                        // the overlay shows a clean state until the
+                        // LRCLIB fetch lands.
+                        karaoke.clear()
+                        Task { @MainActor in
+                            await musicKit.play(song: song)
+                            // Try to fetch synced lyrics by title + artist.
+                            // Best-effort — if LRCLIB has nothing, the
+                            // song still plays, just without lyrics.
+                            let hits = (try? await LRCLibClient.search(
+                                track: result.title,
+                                artist: result.artist
+                            )) ?? []
+                            if let synced = hits.first(where: { $0.syncedLyrics?.isEmpty == false })?.syncedLyrics {
+                                karaoke.track = LRCParser.parse(synced)
+                            }
+                        }
+                    }
+                },
+                onClose: { showMusicSearch = false }
+            )
+        }
     }
 
     // MARK: - Top-left status
@@ -396,6 +564,8 @@ struct ContentView: View {
                 Spacer()
             }
 
+            karaokeRow
+
             audioRow(field: field)
 
             HStack(spacing: 12) {
@@ -424,6 +594,164 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    // MARK: - Karaoke HUD row (stage 1: sample LRC + scrub slider)
+
+    @ViewBuilder
+    private var karaokeRow: some View {
+        HStack(spacing: 12) {
+            Toggle("karaoke", isOn: $karaokeEnabled)
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .onChange(of: karaokeEnabled) { _, on in
+                    if !on { karaokePlaying = false }
+                }
+            Toggle("head blob", isOn: $headBlobEnabled)
+                .toggleStyle(.button)
+                .controlSize(.small)
+            Button {
+                showMusicSearch = true
+            } label: {
+                Label("search", systemImage: "magnifyingglass")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            Button {
+                // Load a local audio file. When one is loaded, the
+                // player owns the karaoke timeline (sample-accurate)
+                // and the reactor receives its samples directly via
+                // the tap installed in `AudioFilePlayer.load`.
+                guard let url = AudioFilePlayer.runOpenPanel() else { return }
+                do {
+                    // Stop Apple Music first so we don't get two
+                    // sources fighting over the speakers.
+                    musicKit.stop()
+                    try audioFile.load(url: url)
+                    audio.switchSource(.audioFile)
+                    if !audio.isRunning { audio.start() }
+                    karaokeEnabled = true
+                    karaokePlaying = true
+                    audioFile.play()
+                    if karaoke.track == nil {
+                        karaoke.loadSample()
+                    }
+                    currentTrackTitle = audioFile.fileName
+                    karaokeLastTick = CFAbsoluteTimeGetCurrent()
+                } catch {
+                    // Surface the failure into the now-playing pill
+                    // so the user sees *something* changed.
+                    currentTrackTitle = "⚠︎ \(error.localizedDescription)"
+                }
+            } label: {
+                Label("file", systemImage: "folder")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            Button {
+                karaoke.loadSample()
+                currentTrackTitle = karaoke.track?.title ?? "Sample"
+                karaokeEnabled = true
+                karaokePlaying = true
+                karaokeLastTick = CFAbsoluteTimeGetCurrent()
+            } label: {
+                Label("sample", systemImage: "music.note.list")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            Button {
+                karaokePlaying.toggle()
+                karaokeLastTick = CFAbsoluteTimeGetCurrent()
+                // Mirror onto whichever player owns the timeline.
+                if musicKit.isActive {
+                    if karaokePlaying { musicKit.resume() }
+                    else              { musicKit.pause() }
+                } else if audioFile.fileURL != nil {
+                    if karaokePlaying { audioFile.play() }
+                    else              { audioFile.pause() }
+                }
+            } label: {
+                Image(systemName: karaokePlaying ? "pause.fill" : "play.fill")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(karaoke.track == nil && !musicKit.isActive)
+            Button {
+                // Stop + eject — clear the loaded track so the user
+                // can see the row reset, useful between demos.
+                karaokePlaying = false
+                musicKit.stop()
+                audioFile.stop()
+                karaoke.clear()
+                currentTrackTitle = nil
+            } label: {
+                Image(systemName: "stop.fill")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(karaoke.track == nil && !musicKit.isActive)
+            // Scrub slider — present even with no track so the row
+            // doesn't reflow when one is loaded; greyed by `disabled`.
+            Slider(value: Binding(
+                get: {
+                    if musicKit.isActive { return musicKit.currentTime }
+                    return karaoke.currentTime
+                },
+                set: { newVal in
+                    karaoke.currentTime = newVal
+                    // Seek whichever player owns the timeline.
+                    if musicKit.isActive {
+                        musicKit.seek(to: newVal)
+                    } else if audioFile.fileURL != nil {
+                        audioFile.seek(to: newVal)
+                    }
+                }
+            ), in: 0...max(0.01,
+                           musicKit.isActive
+                           ? max(musicKit.duration, karaoke.track?.duration ?? 0)
+                           : (karaoke.track?.duration ?? 0.01)))
+                .frame(width: 220)
+                .disabled(karaoke.track == nil && !musicKit.isActive)
+            Text(timecode(musicKit.isActive ? musicKit.currentTime : karaoke.currentTime))
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            if musicKit.isActive, musicKit.duration > 0 {
+                Text("/ \(timecode(musicKit.duration))")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            } else if let t = karaoke.track {
+                Text("/ \(timecode(t.duration))")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            if let title = currentTrackTitle {
+                // Now-playing badge — small, dimmed, with a marquee
+                // dot to signal liveness without flicker.
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(karaokePlaying ? Color.green : Color.secondary)
+                        .frame(width: 6, height: 6)
+                    Text(title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.primary.opacity(0.08))
+                )
+            }
+            Spacer()
+        }
+    }
+
+    private func timecode(_ t: TimeInterval) -> String {
+        let secs = max(0, t)
+        let mm = Int(secs) / 60
+        let ss = Int(secs) % 60
+        return String(format: "%d:%02d", mm, ss)
+    }
+
     @ViewBuilder
     private func audioRow(field: ParticleField) -> some View {
         let f = audio.latest
@@ -441,6 +769,25 @@ struct ContentView: View {
             ))
             .toggleStyle(.button)
             .controlSize(.small)
+
+            // Source picker (mic vs system audio). Flipping while the
+            // reactor is running swaps cleanly; flipping while it's
+            // off just stores the choice for the next start.
+            Picker("source", selection: Binding(
+                get: { audio.source },
+                set: { audio.switchSource($0) }
+            )) {
+                Image(systemName: "mic.fill")
+                    .tag(AudioReactor.InputSource.microphone)
+                Image(systemName: "music.note")
+                    .tag(AudioReactor.InputSource.audioFile)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 80)
+            .help(audio.source == .microphone
+                  ? "Listening to microphone (point it at your speakers for music)"
+                  : "Listening to loaded audio file")
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("strength: " + String(format: "%.2f", field.audioStrength))

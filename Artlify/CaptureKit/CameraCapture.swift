@@ -251,6 +251,40 @@ nonisolated public final class CameraCapture: NSObject, @unchecked Sendable {
         session.addInput(input)
         currentInput = input
 
+        // Cap the device's delivered frame rate so the CMIO extension
+        // upstream of `AVCaptureVideoDataOutput` doesn't queue more
+        // frames than we can drain. iPhone Continuity Camera defaults
+        // to a much higher rate (up to 60 fps) than our compositor +
+        // Vision + SwiftUI overlays can consume, which manifests as
+        // `CMIO_DAL_CMIOExtension_Stream.mm:ReceivedSampleBuffer N queue full`
+        // in Console + matching FPS drops. 30 fps is the documented
+        // Continuity sweet spot and matches our render budget.
+        //
+        // `alwaysDiscardsLateVideoFrames` only drops frames AFTER they
+        // enter our process; it doesn't relieve the driver-side queue.
+        // Capping `activeVideoMin/MaxFrameDuration` is the only way to
+        // tell the camera daemon "don't bother".
+        do {
+            try device.lockForConfiguration()
+            let target = CMTime(value: 1, timescale: 30)
+            // Some devices (e.g. Continuity) refuse arbitrary durations
+            // — clamp to the nearest supported range on the active
+            // format so the assignment can't throw a range exception.
+            if let range = device.activeFormat.videoSupportedFrameRateRanges.first {
+                let minDur = range.minFrameDuration
+                let maxDur = range.maxFrameDuration
+                let clamped = CMTimeMaximum(CMTimeMinimum(target, maxDur), minDur)
+                device.activeVideoMinFrameDuration = clamped
+                device.activeVideoMaxFrameDuration = clamped
+            } else {
+                device.activeVideoMinFrameDuration = target
+                device.activeVideoMaxFrameDuration = target
+            }
+            device.unlockForConfiguration()
+        } catch {
+            log.error("frame-rate cap failed: \(error.localizedDescription, privacy: .public)")
+        }
+
         if !session.outputs.contains(output) {
             output.alwaysDiscardsLateVideoFrames = true
             output.videoSettings = [

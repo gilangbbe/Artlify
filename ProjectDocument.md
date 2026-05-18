@@ -113,7 +113,7 @@ The codebase is organized into independent, testable Swift modules. Each is smal
 | `ParticleKit`        | GPU particle buffer + compute/render pipelines; segmentation mask gradient drives a force field. Pure Metal, no ML. Lives only on the `particles` branch. | Metal, MetalKit |
 | `AudioKit`           | Microphone tap + vDSP FFT → (low/mid/high/level/pan/transient) snapshot consumed by ParticleKit. Off-main-thread analysis. Lives only on the `particles` branch. | AVFoundation, Accelerate |
 | `PromptKit`          | Map detected features (pose, count, motion) → prompt + params | Pure Swift, no deps                 |
-| `AppShell` (SwiftUI) | UI: prompt entry, style picker, FPS HUD, fullscreen toggle, blob-tracking bounding-box overlay  | SwiftUI                               |
+| `AppShell` (SwiftUI) | UI: prompt entry, style picker, FPS HUD, fullscreen toggle, blob-tracking bounding-box overlay, karaoke synced-lyric overlay  | SwiftUI                               |
 
 Rule: **no module imports another module's internals.** They communicate via value types and `AsyncStream`. This keeps each piece replaceable (e.g., we can swap SD Turbo for a different model without touching the renderer).
 

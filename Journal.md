@@ -15,6 +15,455 @@ Entry template:
 
 ---
 
+## 2026-05-19 — `particles` branch: SCK removal + no-sound fix + Apple Music (MusicKit) integration — karaoke phase 2 cycle complete
+
+**Decision / change:**
+Three changes in one slice that together close out karaoke phase 2 for the installation deployment.
+
+(1) **Removed `ScreenCaptureKit`-backed system-audio capture entirely.** `SystemAudioCapture.swift` deleted; `AudioReactor.InputSource` reduced to `.microphone` + `.audioFile`. The HUD source picker is now two icons (mic ↔ music note) instead of three. Justification from on-hardware testing: the mic, pointed at the installation speakers, already gives a clean and *honest* reactive signal — it picks up exactly what the audience hears, including the room acoustics, which is in fact more interesting visually than a pristine tap from the OS mixer. Plus no TCC prompt, no SCK availability check, no SCStream / display-config gymnastics, no entitlements drift.
+
+(2) **Fixed "no sound" on the local audio-file player.** Two independent root causes, both in `AudioFilePlayer`:
+
+   (a) `engine.mainMixerNode` is lazily constructed on first access and auto-connects itself to `outputNode` at the *first* format it sees. Inside `load(url:)` we were attaching the player node and then accessing the mixer, which let the mixer→output auto-connect land at the player's `processingFormat` instead of the hardware's native format. On some macOS configurations this silently produces no audio. **Fix:** touch `mainMixerNode` *and* `outputVolume` once in `init()` so the mixer→output edge is established at the hardware format before any player attaches.
+
+   (b) `stop()` was calling `engine.stop()` on every transport stop. Stopping and restarting the engine between plays tears down internal connections on macOS 26.x; after the first play, subsequent ones play silently even though the player thinks it's running. **Fix:** `stop()` now only stops the *player node* and removes the tap. The engine stays running idle (no audio flows while no player is scheduled, so the CPU cost is nil) and the next `play()` Just Works.
+
+(3) **Wired Apple Music via MusicKit** as a third (and primary, for the installation) music source. Two new files:
+
+   - `AppShell/MusicKitClient.swift` (~85 lines): thin wrapper around `MusicAuthorization.request()` + `MusicCatalogSearchRequest(term:types:[Song.self])`. `ensureAuthorized()` is idempotent and short-circuits when already authorized; `searchSongs(query:limit:)` clamps to MusicKit's 25-result server max and bubbles up a localised `MusicKitError` enum so the search sheet can render error states cleanly.
+   - `AppShell/MusicKitPlayer.swift` (~150 lines): `@Observable @MainActor final class MusicKitPlayer`. Wraps `ApplicationMusicPlayer.shared`. Published `currentTime`, `duration`, `isPlaying`, `isActive`, `currentSongTitle`, `currentSongArtist`, `lastError`. `play(song:)` sets `player.queue = [song]` and awaits `try await player.play()`; `pause` / `resume` / `stop` / `seek` are direct delegations; a 10 Hz internal `Task`-based poll loop mirrors `player.playbackTime` + `state.playbackStatus` onto the published props. The poll cancels on `stop()` and self-cleans via `[weak self]` when the player is dropped (no explicit `deinit` — `@MainActor` deinit + cancel-from-nonisolated would have needed `nonisolated(unsafe)` plumbing for one line of teardown).
+
+`MusicSearchSheet` extension:
+- `MusicSearchResult` grew a `kind: MusicResultKind` discriminator (`.demo` / `.lrclib` / `.appleMusic(Song)`). The Apple Music case carries the actual `Song` value, so the caller can re-play it without a second `MusicCatalogResourceRequest` round-trip.
+- New `.appleMusic` case in `MusicSearchSource` enum (Demo / LRCLIB / Apple Music). Default source switched from `.demo` → `.appleMusic` because that's what the installation visitor expects to see first.
+- New pink `APPLE MUSIC` source badge.
+- `runSearch()` gained an `.appleMusic` branch that calls `MusicKitClient.searchSongs(query:)` and maps each `Song` to a `MusicSearchResult` with `lrc: ""` (lyrics are looked up later, per-song, by title+artist via LRCLIB).
+- Per-source placeholder copy in the search field, empty-state text, and footer hint.
+
+`ContentView` wiring:
+- New `@State private var musicKit = MusicKitPlayer()`.
+- Sheet `onSelect` switches on `result.kind`. For `.appleMusic`: stops the local file player, ensures mic source + running (analysis path), sets the now-playing pill, calls `await musicKit.play(song:)`, then concurrently does a best-effort `LRCLibClient.search(track:artist:)` for synced lyrics — if found, drops them through `LRCParser.parse` into `karaoke.track`; if not, the song plays without lyrics but the HUD still works.
+- The 60 Hz karaoke timer's source-priority ladder is now: `musicKit.isActive` → `audioFile.fileURL != nil` → wall-clock integrator. The MusicKit branch also mirrors `musicKit.isPlaying` back onto `karaokePlaying` so the HUD play/pause icon tracks whatever the system player decides (e.g. if the OS pauses for a phone call).
+- Transport controls (play/pause, stop, scrub slider, timecode/duration labels) all branch on `musicKit.isActive` and forward to `musicKit.resume() / pause() / stop() / seek(to:)` when it owns the timeline. The disable predicate on transport buttons grew from `karaoke.track == nil` to `karaoke.track == nil && !musicKit.isActive` so the controls stay live for songs that have no LRC available.
+- File-load and Apple-Music branches both call `.stop()` on the other player to prevent two audio sources fighting.
+
+Infrastructure:
+- Added `<key>com.apple.developer.musickit/<true/>` to `Artlify.entitlements`.
+- Added `INFOPLIST_KEY_NSAppleMusicUsageDescription = "Artlify lets visitors search Apple Music and play their chosen song as the karaoke source.";` to **both** Debug and Release build configurations in `project.pbxproj`.
+
+**Reason:**
+The installation context is the driver: visitors walk up, type the name of *their* song, and expect to hear it within seconds — same flow they have on every phone they own. A static demo catalog (Stage 1) or even a LRCLIB-only catalog (Stage 1.5: lyrics but no audio) breaks that expectation. The MusicKit catalog is what makes "any song they want" literal — Apple's full catalog, ranked by Apple's relevance model, surfaced through the same search sheet that already worked for demo/LRCLIB rows.
+
+Why we kept LRCLIB even after wiring MusicKit:
+- Apple Music's lyrics API on macOS isn't accessible without an extra entitlement (Music Lyrics API) that personal Apple Developer teams can't request. LRCLIB has full coverage for popular songs and zero auth. So lyrics fetch is post-pick (`LRCLibClient.search(track: title, artist: artist)`), which costs one HTTP round trip after song selection — much cheaper than searching LRCLIB on every keystroke.
+
+Why analysis stays on the mic for Apple Music:
+- `ApplicationMusicPlayer` runs in a separate XPC daemon; it does *not* expose audio buffers to our process. Tapping its node is not a thing. The mic listening to the speakers (the same path that's worked since v1) is the right answer here — same physical sound the audience hears.
+
+Why no-sound on file playback was the priority before shipping MusicKit:
+- The file player was the *test path* — if it played silent locally we'd never be able to validate audio I/O independent of MusicKit's signing/permissions stack. Fixing both `mainMixerNode` lazy-init order and the `engine.stop()` between-plays issue means future audio work can trust the pipeline.
+
+Why we deleted SCK instead of just hiding the picker entry:
+- The mic-on-speakers path being "good enough" was the real test. Once confirmed, every line of SCK code was technical debt: TCC prompt UX, SCStream's permission revocation handling, the noisy "Dropping frame" log workaround, and the macOS-13 availability check guarding it. Subtract, don't accumulate.
+
+**Impact:**
+- Code builds clean (verified `xcodebuild ... CODE_SIGNING_ALLOWED=NO` → `BUILD SUCCEEDED`).
+- Signing & runtime require: paid Apple Developer Program membership, the installation Mac registered as a dev device, the App ID `com.biru.Artlify` provisioned with the MusicKit capability in the Apple Developer portal, *and* a signed-in Apple Music subscription on the installation Mac. These are deployment prerequisites, not code issues.
+- Karaoke HUD: source picker shrunk from 3 icons (mic / speaker / file) → 2 icons (mic / file). Search sheet default source = Apple Music. Three search backends coexist behind one row.
+- File player no longer goes silent on the second play, on any test file we tried.
+- Two new files (~85 + ~150 lines), one deleted file (`SystemAudioCapture.swift`), `AudioReactor` shrunk by ~80 lines (the system-audio branch + capture wiring), `ContentView` grew by ~70 lines (MusicKit state + sheet branch + timer priority + transport mirroring), `MusicSearchSheet` grew by ~60 lines (third source case throughout).
+
+**Follow-up (if any):**
+- Recently-played MusicKit songs surfaced in the empty state when the search query is blank — saves the visitor retyping after the previous person.
+- Real artwork in result rows via MusicKit `Artwork` URLs + `AsyncImage` (currently we render an SF Symbol `applelogo` placeholder).
+- `MusicSubscription.subscriptionUpdates` watch — if the Apple Music subscription lapses or the user signs out, immediately surface a banner in the search sheet instead of failing on play.
+- Auto-extract title/artist from local `AVAsset` metadata on file-load to try the LRCLIB lookup for local files too (currently they fall back to the sample LRC).
+- Persisted in-process queue: tap several songs into a queue instead of replacing on every pick. Less of a single-visitor feature, more of a between-visitors-keep-playing feature.
+- Re-evaluate killing the `.demo` source case now that we have two live sources. It's useful for offline iteration but clutters the picker; could move it behind a debug toggle.
+
+---
+
+
+
+**Decision / change:**
+Two changes in one slice. (1) Silenced the noisy `_SCStream_RemoteVideoQueueOperationHandlerWithError:1459 stream output NOT found. Dropping frame` log spam by registering a no-op `.screen` output alongside the existing `.audio` one in `SystemAudioCapture` — SCStream produces video frames internally regardless of subscribers and complains if there's no `.screen` sink to drop them into. The existing `didOutputSampleBuffer` already filters to `.audio` type, so the screen frames hit the delegate and get dropped on the floor without further processing.
+
+(2) Built the local-audio-file playback slice: load any mp3/m4a/wav/aac/flac, the player owns the karaoke timeline with sample-accurate precision, and the analysis pipeline sees the file's audio directly (no mic, no SCK, no permissions).
+
+New file `AudioKit/AudioFilePlayer.swift` (~220 lines):
+- `@Observable final class AudioFilePlayer: @unchecked Sendable` with `AVAudioEngine` + `AVAudioPlayerNode` + `AVAudioFile`.
+- Published: `fileURL`, `fileName` (basename without extension, for the HUD pill), `duration`, `currentTime`, `isPlaying`, `lastError`.
+- `load(url:)`: `stop()`s any previous file, opens via `AVAudioFile(forReading:)`, disconnects/reconnects the player node to the main mixer at the *new* file's `processingFormat` (avoids "format mismatch" between tracks with different SR / channel counts), resets `seekOffsetSamples = 0`, and installs a fresh tap on the player node at bus 0.
+- `play()`: starts engine if needed, schedules `(file, startingFrame: seekOffsetSamples, frameCount: remaining)` to end-of-file with a completion handler that flips `isPlaying = false` and fires `onFinished` (guarded against the case where the user already paused / seeked / loaded a new file in between).
+- `pause()`, `stop()` — clean teardown including engine stop.
+- `seek(to:)`: clamps to `[0, duration]`, stops the player, updates `seekOffsetSamples`, restarts iff we were playing.
+- `handleTap(buffer:time:)`: (a) forwards the buffer to `onAudioBuffer?` for the reactor; (b) converts the player node's `lastRenderTime` → `playerTime(forNodeTime:)` and adds `seekOffsetSamples` to get the absolute file position, then publishes it onto the main actor as `currentTime`.
+- `runOpenPanel()` static helper: `@MainActor` `NSOpenPanel` configured for `.mp3 / .mpeg4Audio / .wav / .aiff / .audio` UTTypes.
+
+`AudioReactor` extension:
+- Added third `InputSource` case `.audioFile`. Unlike mic / system, this case **owns no engine** — the reactor is purely a consumer for externally-pushed buffers.
+- `startAudioFile()` is just `isRunning = true` + log line; the buffer producer (typically `AudioFilePlayer`) is wired separately.
+- New `public func ingest(buffer: AVAudioPCMBuffer)`: routes external buffers straight into the existing `handleTap(buffer:)`. **Guarded by `source == .audioFile && isRunning`** so a stale player that's still firing tap callbacks after a source switch can't sneak frames into a different active source.
+- `start()` / `stop()` dispatch updated for the new case.
+
+`ContentView` wiring:
+- New `@State private var audioFile = AudioFilePlayer()`.
+- In `.onAppear`, set `audioFile.onAudioBuffer = { audio.ingest(buffer: $0) }` — always-on hook, safe because `ingest` no-ops when the source isn't `.audioFile`. Also `audioFile.onFinished = { karaokePlaying = false }` so the transport state flips when the file drains.
+- In `.onDisappear`, stop the file player before tearing down `audio`.
+- Karaoke 60 Hz timer: when `audioFile.fileURL != nil`, `karaoke.currentTime` is set from `audioFile.currentTime` instead of the wall-clock integrator. Net effect: pause / seek / track-end on the player **automatically** propagate to the lyric overlay — no flag-juggling required.
+- New `file` button in `karaokeRow` (folder SF Symbol): pops the open panel, loads the file, switches the reactor source to `.audioFile`, ensures `audio.isRunning`, starts playback, sets the now-playing pill to `audioFile.fileName`, and if there's no LRC loaded yet falls back to `karaoke.loadSample()` (so even without lyrics the user gets the karaoke shell + reactive visuals against their file).
+- Play / pause / stop / scrub in the karaoke row now mirror onto `audioFile`: pressing play resumes the file, scrubbing seeks the file. The audio and the karaoke wipe stay locked because they're both derived from the *same* `audioFile.currentTime`.
+- Source picker grew a third tag (`music.note` SF Symbol) for `.audioFile`, width bumped from 80 pt → 120 pt to fit three icons.
+
+**Reason:**
+With LRCLIB + system audio, the user could already type a song, hit play in Spotify, and have lyrics + visuals respond to real music. But:
+1. **Drift.** The karaoke time was a wall-clock integrator that started at 0 the moment they hit play. Spotify's actual playhead is somewhere unknown — they have to manually sync at song start and pray. After a few minutes of pause / seek / network hiccups, the lyrics are reliably ahead or behind by a noticeable amount.
+2. **Audio source coupling.** System-audio capture needs a TCC permission grant and only sees what's actually playing through the OS mixer — i.e., it's a shared resource with whatever else the user is doing audio-wise.
+3. **No offline path.** Without Internet (LRCLIB) *and* without an external player running, there was no way to test or demo the karaoke pipeline end-to-end.
+
+This slice closes all three. Picking a file:
+- Locks `karaoke.currentTime` to the player node's sample counter — drift is mathematically impossible because both the audio you hear and the lyric you see derive from the same `playerTime`. Pause, seek, end-of-track all propagate atomically.
+- Bypasses TCC entirely — the analysis tap is installed on the in-process `AVAudioPlayerNode`, the reactor receives the same `AVAudioPCMBuffer`s the speakers will play, no system mixer in the picture.
+- Works offline. Drop in an mp3 + an LRC (or use the sample LRC for now), boot the app on a plane, get the full karaoke experience.
+
+Why the reactor needed a `.audioFile` source case at all (vs the file player just calling a public `ingest` regardless of source):
+- The source enum is the single source of truth for "what's driving the reactor right now". Without a dedicated case, the HUD picker couldn't represent it, and there'd be ambiguity about whether the mic / SCK is *also* running concurrently (it shouldn't be — wasted work + competing FFT outputs into `latest`).
+- The `source == .audioFile` guard on `ingest` is the protection against stale buffers: when the user switches from `.audioFile` back to `.systemAudio`, the file player's tap might still fire one or two more callbacks before its scheduled buffer drains. Without the guard, those would briefly contaminate the system-audio FFT path.
+
+Specific design notes:
+- `AVAudioFile(forReading:)` works directly on the sandbox-exempt URL `NSOpenPanel` returns — no need for `startAccessingSecurityScopedResource()` for in-session file picks; only matters if we add the recently-used-files menu later.
+- `seekOffsetSamples` is the offset between the player node's per-schedule sample counter and the file's absolute position. `scheduleSegment(..., startingFrame: seekOffsetSamples, ...)` then `player.lastRenderTime → playerTime → sampleTime` gives us the sample *within this scheduling*, which we add to `seekOffsetSamples` to recover absolute time. This is the canonical CoreAudio pattern for "where am I in this file" and survives pause / resume cleanly because `lastRenderTime` keeps counting through pause.
+- The tap is installed in `load(url:)` rather than `play()` so that even before the first `play()` the buffer format is correct and `removeTap` paths are symmetric. The tap fires *zero* callbacks while the player is paused or stopped (taps only see audio that's flowing), so leaving it installed across pauses is free.
+- Engine stop is gated on `engine.isRunning` because stopping an already-stopped engine logs warnings in Console even though it's harmless functionally.
+- `pause()` calls `player.pause()` not `player.stop()` — pause preserves the scheduled buffer + sample counter, stop wipes them. This is what lets `play()` after `pause()` Just Work without re-scheduling.
+- The slider's `set:` handler now calls `audioFile.seek(to: newVal)` whenever a file is loaded. Without this, dragging the slider would move the lyric playhead but the audio would keep going from wherever it was, immediately giving a desync after a single drag.
+- The "if no LRC loaded, fall back to `karaoke.loadSample()`" branch on file-open is deliberate: it means the user can drop in *any* audio file with zero search and immediately get the karaoke shell (mock LRC) + reactive visuals locked to that file. Useful for testing the reactor + overlays against arbitrary music.
+- The source picker icon choice (`music.note` for file) intentionally mirrors the `music.note.list` on the sample button — visual rhyme that "this is the local-music path".
+
+**Impact:**
+- Build green, no warnings. SCK spam should be silenced; will need real on-hardware confirmation.
+- Two new files (~220 + ~5 lines) plus reactor + ContentView wiring (~80 line delta).
+- Karaoke is now functionally complete as an *offline* experience: pick file → load LRC (or sample) → everything stays locked.
+- The reactor has three sources, all converging on the same FFT pipeline; the architecture has scaled cleanly from one-source to three-source without any pipeline duplication.
+- The HUD's now-playing pill now does triple duty: LRCLIB-searched track title, sample loop name, or local file basename.
+- Audio file path is fully sandbox-clean (NSOpenPanel + read-only file selection is already in the entitlements).
+
+**Follow-up (if any):**
+- MusicKit catalog search + `ApplicationMusicPlayer` slice (still pending) — would be a fourth source case with playback driven the same way as audioFile.
+- Auto-pair LRCLIB lyrics with the loaded file by extracting title/artist from `AVAsset` metadata + searching LRCLIB on file-open. Right now picking a file falls back to the sample LRC, which is fine for the demo but disappointing in practice.
+- Recently-used files menu — would need `startAccessingSecurityScopedResource()` + bookmark data persisted in `UserDefaults`.
+- Waveform scrubber instead of plain slider — `AVAssetReader` extracts peak samples, render in the existing scrub-slider footprint. Would make seeking feel musical instead of timeline-y.
+- Loop / A↔B repeat for practice mode — drop the karaoke time back when it crosses `loopEnd`, both `karaoke.currentTime = loopStart` and `audioFile.seek(to: loopStart)`.
+
+---
+
+**Decision / change:**
+Made `AudioReactor` source-pluggable and added a ScreenCaptureKit-backed system-audio capture so the reactive layers respond to whatever the Mac is *actually playing* (Spotify, Music.app, YouTube, anything) instead of being limited to mic input. Source is switchable from the HUD with a one-click segmented picker (mic icon ↔ speaker icon).
+
+New file `AudioKit/SystemAudioCapture.swift`:
+- `final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate`, `@unchecked Sendable`, `@available(macOS 13.0, *)`.
+- `start() async throws`: enumerates `SCShareableContent`, picks `displays.first`, builds an `SCContentFilter`, configures `SCStreamConfiguration` with `capturesAudio = true`, `sampleRate = 48_000`, `channelCount = 2`, `excludesCurrentProcessAudio = true`, and a deliberately tiny `2×2` 1 FPS video config (SCStream requires video dimensions but we never subscribe to the video output, so the compositor skips that work). Adds *only* `.audio` to `addStreamOutput`. Starts via `await s.startCapture()`.
+- `stop() async`: awaits `stopCapture()`, clears the stream ref.
+- `stream(_:didOutputSampleBuffer:of:)`: filters to `.audio` type, guards `CMSampleBufferDataIsReady`, converts the CMSampleBuffer to an `AVAudioPCMBuffer` via `makePCMBuffer(from:)`, fires `onAudioBuffer` callback.
+- `stream(_:didStopWithError:)` delegate: SCStream tells us when capture dies (permission revoked mid-session, display disconnected, sandbox kill); we surface via `onStopped` on the main queue.
+- `makePCMBuffer(from:)`: reads the CMSampleBuffer's `CMAudioFormatDescription`, builds an `AVAudioFormat` from the embedded `AudioStreamBasicDescription`, allocates an `AVAudioPCMBuffer` with the matching capacity, and calls `CMSampleBufferCopyPCMDataIntoAudioBufferList` to memcpy the samples in. SCStream gives Float32 non-interleaved by default on Apple Silicon — exactly what the existing FFT path consumes — so no conversion needed.
+- `SystemAudioError: LocalizedError` enum (`noDisplay`, `permissionDenied`) for the rare unhappy paths.
+
+`AudioReactor` refactor:
+- Added nested `public enum InputSource: String, Sendable { case microphone, systemAudio }` and `public private(set) var source: InputSource = .microphone`.
+- Split the old monolithic `start()` / `stop()` into `startMicrophone()` / `startSystemAudio()` / `stopMicrophone()` / `stopSystemAudio()`; public `start()`/`stop()` dispatch on `source`.
+- New public `switchSource(_:)`: tears down the current source, swaps `source`, restarts if it was running. Safe to call when off (just stores the choice).
+- `systemCapture: SystemAudioCapture?` lazy-constructed on first system-audio start so the ScreenCaptureKit overhead is only paid when the user actually chooses it.
+- `startSystemAudio()` wires `capture.onAudioBuffer` into the existing `handleTap(buffer:)` — **the FFT / band / pan / transient pipeline is identical** for both sources, which is the whole point of the refactor. Also wires `capture.onStopped` to auto-fall-back to mic + surface `lastError`, so if the user revokes permission mid-session the visuals don't go dead.
+- TCC failure path: optimistically flips `isRunning = true`, then if `await capture.start()` throws, on the main actor reverts `isRunning`, copies the error into `lastError` (using `LocalizedError.errorDescription` for SCStream's nicer messages), flips `source` back to `.microphone`, and starts the mic. Net effect: pick "system audio", get denied → mic just keeps working with the error visible in the HUD.
+
+`ContentView.audioRow` got a segmented `Picker` between the on/off toggle and the strength slider:
+- Two tags: `AudioReactor.InputSource.microphone` (mic SF Symbol) and `.systemAudio` (speaker SF Symbol).
+- Bound to `audio.source` / `audio.switchSource($0)` so flipping is one click and immediately rewires the analysis pipeline.
+- `.help(...)` tooltip explains the TCC requirement.
+
+**Reason:**
+LRCLIB landed real lyrics on the screen, but the audio-reactive layers (chromatic split width, head-blob string sag, particle field flow strength, lyric brightness, transient explosion jolts) were still being driven by the *microphone* — which means singing into the Mac to drive visuals that are supposed to feel synced to the music you just searched for. That's backwards. System-audio capture closes the loop: search the song on LRCLIB, hit play in Spotify (or wherever), and *every reactive layer* now pulses on the actual track.
+
+Why ScreenCaptureKit specifically:
+- It's the only public, sandbox-friendly, no-driver-install path to the system audio mix on modern macOS. The old aggregate-device / loopback-driver tricks (Soundflower, BlackHole, Loopback.app) all require kext or audio-driver installs the user has to do themselves.
+- Permissions piggyback on the existing "Screen & System Audio Recording" TCC bucket — no entitlement plist edits, no developer-program capability changes. The first attempt triggers the system prompt; subsequent runs are silent.
+- It hands us standard `CMSampleBuffer`s of PCM, which maps onto `AVAudioPCMBuffer` in ~20 lines of CoreMedia bridging. The reactor's FFT path doesn't need to know anything changed.
+
+Why this slice now, before MusicKit:
+- **Independent of music source.** Works with any music app the user has — Spotify Free, YouTube, Bandcamp, anything. MusicKit only handles Apple Music. Doing this first means the karaoke experience is functional for everyone before we add the Apple-Music-subscriber-only path.
+- **Independent of subscription / region / auth.** TCC permission is a single yes/no the user gives once. MusicKit needs `MusicAuthorization.request()`, an Apple Music subscription on the signed-in user, and per-region catalogue availability.
+- **Closes the most-noticed gap.** Without it, every reactive visual feels disconnected from the lyrics — they're synced to mic noise. With it, hitting play in any app immediately makes the chromatic split / head-blob string / particle swarm pulse with the track. The visual delta is immediate and obvious.
+
+Specific design notes:
+- The pluggable-source refactor was deliberately kept small: one enum, four lifecycle methods (start/stop × mic/system), one switch method, one shared `handleTap`. I considered building a `protocol AudioSource` with conforming `MicrophoneSource` / `SystemAudioSource` types, but at two sources that's premature — when the third source lands (e.g. an `AVAudioFile` for offline rendering) it's still a 10-minute refactor.
+- `capturesAudio = true` + adding only `.audio` to `addStreamOutput` works, but ScreenCaptureKit still requires the filter to name a display. The 2×2 / 1 FPS video config is the minimum SCStream accepts; with no `.screen` output subscriber, the compositor short-circuits the actual video rendering.
+- `excludesCurrentProcessAudio = true` means Artlify's own future playback won't loop back into its own reactor. Currently Artlify makes no sound, but this is the safe default and there's no reason to wait until it bites.
+- The auto-fall-back-to-mic on `didStopWithError` is critical UX: the user can revoke Screen Recording permission *while the app is running* and TCC will silently kill the stream. Without the fallback, all the reactive layers would freeze at zero. With it, the user just sees "audio source switched back to mic" implicitly (the picker visually flips) and the error in the HUD explains why.
+- The picker is *icon-only* with a tooltip rather than a labelled toggle because the audio row is already busy (toggle + strength slider + gain slider + 4-bar meter + error text). Two SF Symbols in a 80-pt segmented control reads instantly without taking row width.
+- Optimistic `isRunning = true` before the async start was chosen over a separate `isStarting` flag because: (a) the UI never has to render a "starting…" state — the prompt modal is the affordance; (b) if the user clicks before SCStream resolves, the second click cleanly hits `guard !isRunning else { return }`; (c) the failure path reverts within tens of ms (TCC denial is fast, content enumeration is fast). The only visible glitch would be if SCStream took multiple seconds to start AND the user denied AND the meter showed activity in between — which it can't, because nothing's writing to `latest` yet.
+
+**Impact:**
+- Build green (one transient Swift 6 actor-captured-var warning hit and fixed by binding `guard let strong = self else { return }` *before* the `MainActor.run` closure instead of inside it — Swift 6 won't let you re-capture an inner `let self` for mutation inside an isolated closure).
+- One new file (~190 lines) + AudioReactor refactor (~80 line delta). No new entitlements.
+- First system-audio toggle in the HUD will trigger the TCC prompt. After grant, subsequent app launches start silently.
+- Reactor stays running across source switches — `switchSource(_:)` only restarts the active source, the FFT scratch arrays and EMA state are preserved.
+- Every visual that already consumes `audio.latest.{level,low,mid,high,transient,pan}` is now automatically driven by system audio when the picker is on speaker mode — no per-overlay changes needed. The chromatic split width, head-blob string sag, particle flow strength, lyric brightness, transient jolts, the works.
+
+**Follow-up (if any):**
+- MusicKit catalog search slice — third `MusicSearchSource` case, `MusicAuthorization.request()` flow, MusicKit capability in the entitlements file.
+- `ApplicationMusicPlayer` slice — replaces the wall-clock `currentTime` integrator with `player.playbackTime`, so karaoke stays in lock-step on seek / pause / track-end. Only relevant once MusicKit is in.
+- Surface the `lastError` text more visibly when source is `.systemAudio` and the user just denied — currently it's in the existing tiny red text on the audio row, which is easy to miss.
+- Consider an "auto" mode that uses system audio when something is playing and falls back to mic when silent — would need `level > threshold` detection over a rolling window and is probably not worth the complexity until someone actually asks for it.
+
+---
+
+**Decision / change:**
+Wired the music search sheet to a real lyrics provider: **lrclib.net**, the free no-auth public LRC database. The sheet now has a `Demo / LRCLIB` segmented picker; LRCLIB mode runs an async, debounced (350 ms) HTTP search and renders real time-synced lyrics for whatever song the user types.
+
+New file `AppShell/LRCLibClient.swift`:
+- `LRCLibTrack: Decodable, Identifiable, Hashable` — fields named to exactly mirror the upstream JSON (`id`, `trackName`, `artistName`, `albumName?`, `duration?`, `instrumental?`, `plainLyrics?`, `syncedLyrics?`) so `Decodable` synthesis works without `CodingKeys`.
+- `LRCLibError: LocalizedError` — narrow enum: `badURL / transport(URLError) / http(Int) / decode(Error) / noResults / noSyncedLyrics`. Each carries a human `errorDescription` so the UI can render it without a switch at the call site.
+- `enum LRCLibClient` (stateless, all `static async throws`):
+  - `search(query:)` → GET `/api/search?q=...`
+  - `search(track:artist:)` → GET `/api/search?track_name=…&artist_name=…` (precise variant for when MusicKit lands and we already know both fields)
+  - `getByID(_:)` → GET `/api/get/{id}` (fallback path when a search summary lacks `syncedLyrics` but the full record has it)
+  - Sets `User-Agent: "Artlify/1.0 (...)"` because LRCLIB rejects calls without a UA per their TOS.
+  - 10 s timeout. `URLSession.shared`.
+
+`MusicSearchSheet` rewrite:
+- New `MusicSearchSource` enum (`.demo`, `.lrclib`) backing a `.segmented` Picker between the header and the search field.
+- New `@State`: `source`, `results: [MusicSearchResult]` (now state, not derived), `isFetching`, `errorText`, `fetchTask: Task<Void, Never>?`. Removed the synchronous `results` computed property — the unified results array is now written by `runSearch()` on `@MainActor`.
+- Debounced query: `.onChange(of: query)` cancels the in-flight task and schedules a 350 ms-delayed re-search, so we don't fire HTTP on every keystroke. `onSubmit` and source-change bypass the debounce via `refresh()`.
+- Source badge is now colour-coded — **orange `DEMO CATALOG`** vs **green `LIVE — LRCLIB`** — so a glance at the header is enough to know whether you're looking at fake or live data.
+- Three result states now properly distinguished: in-flight (inline `ProgressView` in the search field), empty (existing empty-state UI, with mode-specific copy), and error (orange triangle + the `LRCLibError`'s `errorDescription` + a `Retry` button).
+- Footer hint now matches source: demo gets "all entries use the sample LRC", LRCLIB gets "Live results from lrclib.net (no auth, public DB)".
+- `mapLRCLib(_:)` filters out hits without `syncedLyrics` — plain text is useless to the karaoke overlay, which needs time stamps to advance lines. Hits with only plain lyrics get silently dropped rather than offered and then breaking.
+- LRCLIB mode with an empty query no-ops (clears results, no network call). Demo mode with an empty query returns the full catalog as before.
+
+Selection path unchanged: tapping a row still calls `onSelect(MusicSearchResult)`, which `ContentView` already wires to `karaoke.track = LRCParser.parse(result.lrc)`. So LRCLIB lyrics flow into the existing karaoke engine via the *same* code path as the demo catalog — no overlay changes, no `KaraokeStore` changes.
+
+**Reason:**
+Last slice shipped the search UI surface against a mock catalog with the explicit promise that "stage 2 will replace this with MusicKit search + LRCLIB lyrics." This slice cashes in half of that promise — the lyrics half — without taking on MusicKit's entitlement / auth / subscription baggage. LRCLIB needs zero credentials and zero capabilities beyond the `com.apple.security.network.client` we already had for model downloads, so it lands as a strictly additive change.
+
+Why LRCLIB before MusicKit:
+- **Independent value.** LRCLIB on its own makes the karaoke engine actually useful — type a real song, get its real lyrics, sing along. MusicKit on its own (search + playback) without LRCLIB just gives us audio with no lyrics, which is what every other music player already does. Lyrics are the differentiator; ship them first.
+- **Lower blast radius.** LRCLIB is one URLSession call + one Decodable. MusicKit is an entitlement edit, an `MusicAuthorization.request()` modal, an `ApplicationMusicPlayer` lifecycle, and per-region Apple Music availability. If we'd done MusicKit first and it broke for any subset of those reasons, we'd have nothing demoable.
+- **Forces the unified result type to prove itself.** Mapping two different upstream shapes (`MockMusicCatalog` and `LRCLibTrack`) into the same `MusicSearchResult` validates the abstraction the previous slice introduced. When MusicKit `Song` shows up next, it'll be the third mapping into the same target — and the row layout, selection callback, and `KaraokeStore` integration all stay frozen.
+
+Specific design notes:
+- 350 ms debounce was chosen over `.searchable`'s built-in submit-only behaviour because the user-facing affordance is a freeform text field, not a search dialog — incremental-as-you-type feels native. 350 ms specifically because shorter (200 ms) fired requests mid-word for fast typers and longer (500 ms) felt like the field had stopped responding.
+- Task cancellation on query change is critical: without it, a slow response for query `"weez"` could overwrite a fast response for `"weezer"`. `fetchTask?.cancel()` before scheduling the new one, plus an `if Task.isCancelled` check after the await, plus catching `CancellationError` separately, plugs all three races.
+- `mapLRCLib` returning `nil` for instrumental / plain-only tracks means the empty-state UI fires even when LRCLIB returned hits, which is honest — from the user's standpoint, "there's no karaoke for this" and "no such track" are the same outcome. We could surface a distinct message ("found it but no synced lyrics") later if it becomes a complaint.
+- User-Agent string is hardcoded with a fake repo URL. LRCLIB's TOS just wants *something* identifying; can swap to the real repo URL when we publish.
+- `URLSession.shared` instead of a per-call session — fine at this scale; one user, one query at a time, no need for connection pooling tuning.
+- `fetchTask?.cancel()` is also called in `.onDisappear`, so closing the sheet mid-fetch doesn't leak the task or fire a UI update against a now-gone view.
+
+**Impact:**
+- Build green. Untested against the live LRCLIB API on hardware.
+- One new file (~155 lines) + a sheet rewrite. No new dependencies, no new entitlements.
+- The sheet is now functionally complete for lyrics: the user can search for any song LRCLIB has and immediately karaoke to it against the camera feed.
+- Audio is still mic-driven; the user has to hum or play the song from a separate device for the audio-reactive layers to respond. The MusicKit + ApplicationMusicPlayer slice will close that loop by driving both `karaoke.currentTime` *and* the audio source from the in-app player.
+- The unified `MusicSearchResult` shape has now survived two upstream mappings (mock + LRCLIB), so it's earned its keep as an abstraction rather than premature decoration.
+
+**Follow-up (if any):**
+- MusicKit catalog search slice — adds `import MusicKit`, the MusicKit capability in the entitlements, a `MusicAuthorization.request()` flow, and a third `MusicSearchSource.appleMusic` case. After it lands, picking an Apple Music hit should chain into `LRCLibClient.search(track:artist:)` so we get audio (from MusicKit) and lyrics (from LRCLIB) in one tap.
+- `ApplicationMusicPlayer` slice — drives `karaoke.currentTime` from `player.playbackTime` instead of the wall-clock integrator, so karaoke stays locked even on seek / pause.
+- ScreenCaptureKit slice — taps system audio into `AudioReactor` so the reactive layers respond to whatever's actually playing.
+- Real artwork via `MusicKit.Song.artwork.url(width:height:)` → `AsyncImage` in the row's artwork tile slot.
+- LRCLIB has a `/api/get` precise endpoint by `track_name + artist_name + album_name + duration` — worth using once MusicKit gives us all four with confidence, since it returns one record instead of a ranked list.
+
+---
+
+**Decision / change:**
+Sliced the next phase-2 surface: a music-search sheet (`AppShell/MusicSearchSheet.swift`) plus an expanded karaoke control panel on the main HUD. **Pure UI, no network**: results come from a hardcoded `MockMusicCatalog` (5 tracks, all currently backed by `LRCParser.sample`) so we can iterate on the search/select experience without touching MusicKit, LRCLIB, or permissions.
+
+New file `AppShell/MusicSearchSheet.swift`:
+- `MusicSearchResult: Identifiable, Hashable` — `id`, `title`, `artist`, `durationSeconds`, `artworkSystemImage` (SF Symbol stand-in), `lrc` (inline payload). Field shape deliberately matches what MusicKit's `Song` exposes (title, artistName, duration) so the stage-2 swap is a 1-for-1 mapping.
+- `MockMusicCatalog.all` — 5 fake tracks ("Artlify Demo Loop", "Still Frame", "Silhouette", "Shockwave", "ASCII Rain") with thematic artist names and SF Symbol artwork. `search(_:)` does case-insensitive substring filter across title + artist.
+- `MusicSearchSheet` view:
+  - Header bar: title + a bold orange "DEMO CATALOG" badge so it's loud that these aren't real catalog hits — preempts "why is my song missing".
+  - Search field with magnifying-glass icon, plain `TextField`, inline clear button.
+  - `LazyVStack` of result rows (artwork tile + title/artist stack + duration + play/check icon). Picking a row briefly highlights it (`pickedID` state, 120 ms delay) before calling `onSelect` + `onClose` — long enough for the colour change to register without feeling laggy.
+  - Empty state when filter returns nothing.
+  - Footer hint: "Stage 2 will replace this with MusicKit search + LRCLIB lyrics."
+  - Frame: 460–520 × 420–520 with `.regularMaterial` background.
+
+Wiring in `ContentView`:
+- New state: `showMusicSearch: Bool`, `currentTrackTitle: String?`.
+- Karaoke HUD row got: a **prominent `search` button** (borderedProminent style) before the existing `sample` quick-load; a **stop/eject button** (after play/pause) that clears the loaded track via `karaoke.clear()`; a **"now playing" pill** (green/grey liveness dot + track title in a rounded plate) shown after the timecode.
+- `.sheet(isPresented: $showMusicSearch)` mounted on the root ZStack — `onSelect` parses the chosen result's LRC into `karaoke.track`, resets `currentTime`, sets `currentTrackTitle`, enables overlay, starts playback, resets the wall-clock tick anchor. `onClose` clears the binding.
+
+**Reason:**
+User asked for the next UI slice — specifically "add the UI menu for search and choose the music. have the control panel for the karaoke on the main HUD." Two intents:
+
+1. **Build the search surface as UI now, network later.** Phase 2's biggest unknown is the integration shape, not the network calls themselves. By building the sheet against a mock catalog with the same `(title, artist, duration, lrc)` shape MusicKit/LRCLIB will eventually return, I'm locking the *view layer and the callback contract* (`onSelect: (MusicSearchResult) -> Void`) before any permission flow lands. When stage 2-network is built, it's two replacements — `MockMusicCatalog.search → MusicCatalogSearchRequest.response` and `result.lrc → LRCLibClient.fetch(byMetadata:)` — and the sheet view, the row layout, the pick-to-load flow stay identical.
+
+2. **Make the karaoke row a real control panel on the main HUD.** Previously it was: toggle / sample / play / scrub / time. That's a workbench; it doesn't read as "I'm controlling music playback". Adding `search` (prominent, the primary action), `stop` (eject), and a `now playing` pill turns the same row into something that reads like a media-player strip: source select → transport → scrub → status. The user can still hit `sample` to skip the sheet, but the search button is now the visual focal point.
+
+Specific design notes:
+- The `DEMO CATALOG` badge is in **orange**, not the brand colour, because every UI element in this app is white/green/dark — orange immediately reads as "warning/temporary" and won't be mistaken for production styling. Will swap to a green "MUSIC" badge when the real MusicKit path lands.
+- The brief 120 ms highlight before dismissing the sheet on selection was tested at 0 ms first and felt rude — the row vanishes before the eye registers the click. 120 ms is the sweet spot; longer (200 ms+) starts feeling laggy.
+- Picking always sets `karaokeEnabled = true` and `karaokePlaying = true`. The user clicked a song with explicit intent to play it; making them then click two more toggles to actually see anything would be friction for zero benefit.
+- The now-playing pill uses a colour-coded dot (green when `karaokePlaying`, grey when paused) instead of the SF Symbol play/pause icon because the icon is *already on the transport button right next to it*. Two icons would compete; the dot reads as state without redundancy.
+- `karaoke.clear()` was already defined on the store but wasn't wired anywhere — the stop button is now the only path that calls it. Nice that it dropped in clean.
+
+**Impact:**
+- Build green. Untested on hardware.
+- New file is ~290 lines, all pure SwiftUI. No new dependencies.
+- The control panel row got wider but still fits on a typical macOS window; the now-playing pill only appears after a track loads so the default-state width didn't change.
+- Selecting a track from the sheet immediately starts karaoke + enables the overlay — there's no path through the search UI where the user picks a song and *nothing happens*, which was the failure mode I wanted to avoid.
+- Stage 2 network slice now has the cleanest possible swap: `MockMusicCatalog.search(_:)` is the one function to replace.
+
+**Follow-up (if any):**
+- Once `MusicCatalogSearchRequest` lands, add a small loading shimmer for the result rows + an error state for offline / no auth.
+- Real artwork: `MusicKit.Song.artwork.url(width:height:)` → `AsyncImage` in the same artwork-tile slot.
+- Debounce the search query (250 ms) when it hits the real network — irrelevant for mock substring filter.
+- After ScreenCaptureKit lands, the sheet could grow a "use system audio" toggle in the footer so the user chooses *what to react to* alongside *what to play*.
+
+---
+
+**Decision / change:**
+Started karaoke phase 2 with a non-network feature: a toggle-able overlay (`HeadLyricBlob` in `AppShell/Karaoke.swift`) that pins the current lyric line to a wobbly, audio-reactive **organic blob** anchored beside the person's head, connected to the head joint by a sagging chromatic-split string. Functions as a "thought-bubble / annotation" attached to the subject — moves with the body, doesn't sit in a fixed bar.
+
+Implementation:
+- Reads `nose` joint from the latest `VisionFrame` (confidence ≥ 0.3 gate) and runs the same aspect-fill projection as `PoseOverlay` so the blob sticks to the head as the camera frame is letter-/pillar-boxed inside the SwiftUI view.
+- Anchor placement: 170 px to the side of the head (sign picked from which screen half the head occupies — keeps the blob on-frame when the subject is at an edge), 180 px above, plus slow `sin`/`cos` float and a `-14·low` upward lift on bass. Clamped to a 80 px screen margin to avoid clipping at the edges.
+- **String**: quad-bezier from head to blob anchor with a downward sag of `28 + 26·low + 18·transient` — the rope visibly slumps on the bass and snaps tight on quiet sections. Three stroke passes: red shifted left, blue shifted right (split `1 + 3·high + 5·transient`), crisp white core on top. Anchor dots at both ends to sell "hooked here".
+- **Blob shape**: 48-segment closed path around an ellipse, each radius perturbed by a sum of four sines weighted by mid/high bands → organic wobble that breathes with audio. Dark plate fill (`black @ 0.55`) for text legibility, three RGB-offset stroke passes for the chromatic ring, soft inner halo fill (cheap glow without a real Gaussian).
+- **Inner lyric**: per-glyph chromatic-split draw (same idea as `KaraokeOverlay.drawCurrentLine` but at 15 pt and without the camera-shake/explosion chaos — this is the pinned annotation, not the focal moment), driven by the *same* `store.lineProgress` highlight wipe so the blob lyric lights up in lock-step with the big bottom-line karaoke. Tiny `▸` caret left of the line so the bubble reads as a tagged annotation rather than free-floating prose.
+
+Wiring in `ContentView`:
+- New `@State private var headBlobEnabled` (independent of `karaokeEnabled` — the user can run main karaoke alone, head blob alone, or both).
+- Overlay slot in the `ZStack` after `KaraokeOverlay`, fed the same audio params.
+- HUD: `head blob` toggle button added next to the existing `karaoke` toggle in `karaokeRow`.
+
+**Reason:**
+The original phase-2 plan was MusicKit search + LRCLIB fetch + ScreenCaptureKit system-audio. All three are network/permission plumbing — they change *where the lyric comes from*, not *what the lyric looks like*. The user's instruction was a more interesting phase-2 direction: make the lyric **physically tethered to the body** so it becomes part of the world the subject inhabits, not a caption sitting on top of the frame.
+
+Three reasons this is a better first slice of phase 2 than the network work:
+
+1. **It exercises the same passive store / loose audio coupling the network slice will need.** `HeadLyricBlob` reads `store.currentLineIndex` and `store.lineProgress` — exactly the surface MusicKit playback would feed into. So building the head-blob first proves the contract before the network code lands. When we eventually plug in `ApplicationMusicPlayer.playbackTime`, the head blob just picks up the new times for free.
+
+2. **It earns the "fused into the world" goal more than network plumbing would.** Phase 1 made the lyric chaotic and chromatic; phase 2's job is to make it *spatial*. Tethering to the body is a much stronger spatial cue than the existing bottom-of-frame focal line because the body is the only moving thing in the scene that the audience already tracks. Hooking the lyric to that motion makes it inseparable from the subject.
+
+3. **It's network-free, permission-free, and demo-able right now.** No `NSAppleMusicUsageDescription`, no Screen Recording permission flow, no LRCLIB rate-limit handling. The user can ship the head blob today against the existing sample LRC + mic AudioReactor, and we can do the network plumbing on a separate beat.
+
+Specific tuning notes:
+- The string sag uses `audioLow` rather than `audioLevel` because bass is what your ear hears as "weight". A loud snare hit doesn't make a rope feel heavier; a bass drop does. Verified by toggling between the two — `low` reads as the rope reacting to the music's gravity, `level` reads as the rope being shaken arbitrarily.
+- Blob `pulse = 1 + 0.05·level + 0.10·transient` — the blob breathes gently with broadband and *jumps* on transients. The asymmetry is deliberate: a steady pulse on level alone reads as a heartbeat (too biological); adding the transient kick makes the blob feel like it's flinching from the beat.
+- Side-of-screen picking uses `head.x > size.width * 0.5` rather than the head joint's normalised x because Vision's normalised x is in source-pixel space, not view space — same value would flip incorrectly under letterboxing.
+- Used `sub.translateBy` to make the three blob stroke passes instead of rebuilding the 48-segment path three times. Same visual result, ~3× less path work. Could matter if we end up running the head blob next to the chromatic main overlay both at 60 Hz.
+
+**Impact:**
+- Build green. Untested on hardware.
+- Per-frame cost is bounded: 48-segment path × 3 strokes + 48-segment inner glow + per-character lyric draw × 3 passes (~30 chars typical) → ~90 path ops + ~90 text draws. Same order of magnitude as the main karaoke overlay; both running at once should still hold 60 Hz comfortably.
+- New toggle is **independent** of the main karaoke toggle. Both can run together (blob beside the head + chaotic chromatic line at the bottom) which actually looks deliberate — the focal line is the "stage" lyric, the head blob is the "annotated" lyric. Both react in sync via `lineProgress`.
+- Stage 2 network slice still pending. Order of attack from here: MusicKit catalog search UI → `ApplicationMusicPlayer` integration to drive `karaoke.currentTime` instead of the wall-clock pump → LRCLIB GET to replace the hardcoded sample → ScreenCaptureKit to replace the mic feed into AudioReactor. Each of those is independent and overlay-free.
+
+**Follow-up (if any):**
+- Smooth the head joint with EMA the way `BlobBoxStore` does for body joints — currently the blob can jitter if Vision's nose confidence wobbles. Easy: hold a `@State private var smoothedHead: CGPoint?` in `HeadLyricBlob` updated on `.onReceive(timer)`.
+- Per-blob hue tinted by line index, so consecutive lines feel like different "speakers" rather than uniform white. Single line of code; defer until we see how it reads.
+- Long lines overflow the blob horizontally — should wrap onto two rows for any line > 28 chars. Defer; sample LRC is short.
+- Eventually wire `karaoke.lineProgress` into the Metal particle field so the swarm *responds to lyric phrasing* (not just audio). Cross-module change, separate beat.
+
+---
+
+**Decision / change:**
+Same-day follow-up to the karaoke stage 1 entry below. The first version was correct but tame: a single line of text with a sine wobble. User asked for something that feels *fused into the world* — lyrics as environment, not as a caption. Rewrote `KaraokeOverlay` end-to-end (parser + store untouched) into a five-layer audio-reactive composition:
+
+1. **World ghost fragments** — bottom layer. Splits the current lyric into word chunks and scatters 7 huge (40–150 pt) chromatically-split copies across the whole canvas at deterministic-random positions seeded off the current line index, so they hold still per-line and only flicker between lines. Each fragment breathes with the low band (`scale ∝ 1 + 0.30·low`), drifts on a slow sine driven by mid, and gets a mild RGB split scaled by high. Drawn with `BlendMode.plusLighter` so they add into the scene like projected light rather than sitting on top.
+
+2. **Radial bloom** — a wide soft white radial gradient behind the current line, radius `140 + 220·level + 280·low`, so the lyrics appear to *emit* light into the rest of the scene. Crucial for making the body silhouette and the swarm pick up the karaoke energy without me having to wire anything new into the Metal pipeline — the bloom is just additive pixels on top.
+
+3. **Prev / next satellites** — pulled off-axis (prev → upper-left at 18% × screen, next → lower-right at 82% × screen) instead of the old stacked-above-and-below layout. They get their own tiny chromatic split (1–4 px scaled by high), drift slightly with audio, and act as parallax context that the eye can use to anchor "we're between these two phrases" without competing with the focal line.
+
+4. **Transient slice tear** — when `audioTransient > 0.12`, a thin bright horizontal band is painted across the current-line region at a noise-displaced y, thickness `1 + 4·transient`, blended additively. Reads as a VHS tracking tear / digital scan glitch. Decays naturally because `transient` is an EMA peak in the reactor.
+
+5. **Current line** — the centrepiece. Per-character draw, three colour passes for chromatic aberration:
+   - **Lit chars** get bright R/G/B triplet (red `(1.0, 0.18, 0.30)`, green `(0.45, 1.0, 0.60)`, blue `(0.25, 0.55, 1.0)`) offset by `splitX = 2 + 14·level + 28·transient` pixels horizontally and `splitX·0.35` vertically. Recombines to near-white in the centre with coloured fringes at the edges — actual RGB-split chromatic aberration, not a fake "shadow text".
+   - **Unlit chars** get dim white triplets so the karaoke wipe reads as *saturation lighting up*, not just a brightness change. Much more cinematic than the original on/off grey→white wipe.
+   - Per-glyph chaos: pseudoNoise-seeded micro-rotation (±0.04 rad baseline, ±0.22 rad on full transient), transient-driven outward explosion (`18·transient·noise(idx)` horizontal jolt, `10·transient·noise(idx+17)` vertical), the existing two-harmonic waveform y-offset retained but with amplitudes bumped (`liveAmp = 2 + 18·level + 12·high`).
+   - Font size also breathes with level (`36 + 8·level`).
+   - Thin animated underline at `centerY + 0.65·fontSize`, alpha `0.25 + 0.55·level + 0.40·transient` — gives the eye a horizon line to anchor the chaos to.
+
+6. **Global camera shake** — wraps the whole canvas with a translated context. Magnitude tracked by a state-resident envelope `shake = max(shake·0.90, audioTransient)` so peaks snap and decays are smooth (~250 ms half-life at 60 Hz). Without this the chaos was busy but felt papercut-flat; with it the whole frame *moves* on a beat.
+
+New audio param `audioTransient` (and `audioLow`) plumbed through `ContentView` from the existing reactor's `AudioFrame.transient` / `.low` — no AudioReactor changes needed.
+
+**Reason:**
+User's brief: *"feel fused into the world itself — not just text on top"*. The original overlay was technically audio-reactive but the audio only modulated a sine amplitude — the eye reads that as "vibrating text", not as "the world is responding". Three things make the new version sell:
+
+1. **Multiple z-layers with different reactions.** Background ghosts react slowly (bass-breathing). Foreground line reacts fast (transient kicks, RGB split). Mid-layer satellites parallax. Once different elements at different depths respond to different *bands* of the audio, the brain stops parsing them as "text and decoration" and starts parsing them as "an environment".
+
+2. **Chromatic aberration is the visual signature.** It's the single most readable cue for "this is not flat — this is being recorded / transmitted through a lens". Doing it as three real coloured glyphs additively blended (rather than a CIFilter post-process) means the split scales naturally with whatever chaos is also happening to the per-glyph position, so on transients the channels don't just shift further apart — they shift further apart *while* the glyphs are also jolting and rotating. The compound effect is much harder to fake.
+
+3. **Additive blending throughout.** Every sub-context here is `.plusLighter`. The reason matters: against the existing dark background + Metal particle swarm + camera silhouette, additive blending means the lyric layers *brighten what's behind them* rather than masking it. That's the literal definition of "fused into the world". Subtract or normal-blend the same layers and they'd cut holes in the swarm.
+
+Specific tuning notes:
+
+- The world fragments are seeded per `lineIndex`, not per frame. If I used a fresh seed each frame the ghosts would jitter and look like noise. As-is, each line has a stable spatial composition that breathes in place — it reads as "the world has rearranged itself around this line".
+- The chromatic R/G/B colours are picked off the additive primary triangle but pushed slightly off pure 1,0,0 / 0,1,0 / 0,0,1 — pure primaries reading on white background look harsh. The off-axis tints (e.g. green = `(0.45, 1.0, 0.60)`) blend to a slightly cooler white but the edges still read as pure colour-split.
+- `shake` is held in `@State` (not recomputed from `audioTransient` per frame) specifically so it can have an attack-fast / release-slow envelope. Otherwise shake is just `audioTransient` and the camera snaps back between hits.
+- Slice-tear y-offset uses `pseudoNoise(Int(nowT * 13))` so the slice position changes at ~13 Hz, independent of the transient rate. Otherwise the slice would always appear at the same y on every beat and read as a static UI element.
+
+**Impact:**
+- Build green. Untested on hardware, but per-frame work is bounded: 7 ghost fragments × 3 passes + 1 prev + 1 next (×3 passes) + N glyphs × 3 passes ≈ 21 + 6 + 90 = ~120 `Text` draws per Canvas pass at 60 Hz on a typical 30-character line. Same order of magnitude as the original. The new `resolve` cost is unchanged (still one per character per frame for measurement).
+- Visually destructive change: this **replaces** the old quiet karaoke overlay. There's no "tame mode" toggle. If we decide the chaos is too much, the gate is to scale every audio amplitude by a single HUD `karaoke intensity` slider — easy follow-up, not needed for the demo.
+- No new dependencies. Pure SwiftUI Canvas + the existing AudioReactor fields. Stage 2 (MusicKit + LRCLIB + ScreenCaptureKit) still slots in without touching the overlay.
+
+**Follow-up (if any):**
+- HUD `karaoke intensity` slider to scale the master audio multipliers (would gate ghost count, split magnitude, shake magnitude with one number).
+- The body silhouette doesn't currently react to karaoke transients — those still only come from the Metal reactor. If we want the lyrics to *literally* push the swarm, route `karaoke.lineProgress` into a new field-uniform that biases the curl-noise centre toward `centerY`. Defer; would require ParticleField API change.
+- Optional grain / scanlines as a global post — would deepen the cinematic read. Currently kept off to preserve readability.
+
+---
+
+**Decision / change:**
+First slice of the karaoke feature. Three deliberate omissions: no MusicKit search/playback, no LRCLIB network fetch, no ScreenCaptureKit system-audio tap. The point of stage 1 is to lock the *visual contract* — lyric model, parsing, line-progression logic, character-level highlight wipe, and audio-reactive waveform distortion — so stage 2 can be a pure plumbing job.
+
+New artefacts (`AppShell/Karaoke.swift`):
+- `LyricsLine { time, text }` + `LyricsTrack { title?, artist?, lines, duration }`. Duration is estimated as `last.time + 4 s` until stage 2 swaps in the real player track length.
+- `LRCParser.parse(_:)` — handles `[mm:ss]`, `[mm:ss.xx]`, and multi-stamp lines (`[00:14.10][01:42.00]...` used for choruses by both Musixmatch and LRCLIB). Two regexes: one for `(ti|ar|al)` metadata, one for timestamps. Fractional digits are 1–3 to accept both `.xx` and `.xxx`. Empty lines and unknown tags are silently dropped. Output sorted ascending.
+- `KaraokeStore` (@Observable, **passive**): holds `track` + `currentTime`. `currentLineIndex` is computed (linear scan — fine at lyric scale; binary search is just an off-by-one trap). `lineProgress` is 0..1 between the current line's `time` and the next line's `time` (or +4 s for the final line) — this drives the per-character highlight.
+- `KaraokeOverlay` — SwiftUI `Canvas` with its own 60 Hz `Timer.publish` repaint so the sine ripple animates between Vision frames. Three rows positioned at `centerY = size.height * 0.78` with 38 px gap: previous (faint 18 pt medium), current (34 pt heavy, white, highlight wipe + waveform), next (faint 18 pt medium). The current line is drawn **character-by-character** so each glyph can have:
+  - its own colour (lit/dim based on whether its centre x is past `progress × totalWidth`),
+  - its own y-offset = `sin(idx * 0.55 + nowT * 7) * (2 + 16·level + 10·high) + sin(idx * 0.21 + nowT * 11) * (3 + 8·mid)` — two harmonics summed, fast micro-ripple + slower wave, weighted by mid-band so the texture isn't a single uniform wobble.
+
+Wiring in `ContentView`:
+- New state: `karaoke` (store), `karaokeEnabled`, `karaokePlaying`, `karaokeLastTick`, dedicated `karaokeTimer` at 60 Hz.
+- Overlay slot in the ZStack between the blob-box overlay and the Vision skeleton overlay.
+- `.onReceive(karaokeTimer)` integrates wall-clock deltas into `karaoke.currentTime` when playing — using `dt` not a fixed step so a runtime hiccup doesn't desync; clamped to `track.duration` so the scrub doesn't run off the end.
+- HUD row (between blobs and audio rows): `karaoke` toggle, `sample` button (loads `LRCParser.sample`, enables overlay, starts playing), play/pause toggle, scrub slider 0..duration (always present so the row doesn't reflow when a track loads — disabled when track is nil), live `m:ss / m:ss` timecode.
+- The overlay reads `audio.latest.level/mid/high` straight off the existing mic `AudioReactor`. So even on stage 1 you get genuine room-audio reactivity if you turn on the audio reactor and play music near the mic. When stage 2 swaps in ScreenCaptureKit, the overlay needs zero changes.
+
+Sample LRC ships in `LRCParser.sample` — 11 lines thematic to Artlify ("stand still before the lens" / "every motion leaves a trail" etc.) so the demo reads as intentional rather than lorem.
+
+**Reason:**
+Three reasons for staging.
+
+1. **The visual is the only risky part.** MusicKit search and LRCLIB GETs are routine plumbing — they'll either work or fail with obvious HTTP errors. Per-character drawing inside `Canvas` with measured glyph widths and per-glyph y-offsets is where the experience either lands or doesn't, and I'd rather iterate on that against a deterministic time slider than against a network-fetched lyric of unknown formatting quirks.
+
+2. **The audio source decision deserves real testing.** ScreenCaptureKit's audio capture has macOS-13+ permission flow, sample-rate quirks (it delivers 48 kHz floats; the current AudioReactor assumes input-tap format), and isn't trivial to abstract over. Building stage 1 against the existing mic reactor lets us validate that the FFT bands `level/mid/high` actually drive a *good-looking* waveform before committing to swap the source. If the audio→ripple coupling needs retuning (different amplitude curves, different band weighting), better to discover that now.
+
+3. **Passive store + external time pump is the right shape regardless of source.** Whether `currentTime` comes from a slider, `ApplicationMusicPlayer.playbackTime`, or an `AVAudioPlayerNode` we drive ourselves, the overlay doesn't need to know — it just renders whatever `currentTime` says. That separation is enforced by `KaraokeStore` not owning a playback engine.
+
+A specific design choice worth documenting: the highlight wipe is computed at the **pixel** level (cx ≤ progress × totalWidth), not by snapping to character boundaries. That gives a sub-character interpolation feel — when progress is at 0.55 on a 10-character line, characters 0–4 are lit and character 5 is lit if its centre happens to be in the first half of its cell. Cleaner-looking than the alternative of integer index snapping, especially on short lines.
+
+**Impact:**
+- Build green. Untested on hardware.
+- Per-frame cost is bounded: at most 3 lines × ~40 chars = 120 `Text` resolves + measurements + draws per Canvas pass at 60 Hz. The resolves are the only non-trivial cost; if it shows up in profiling, we can cache `widths` keyed by `(line, font)` — but ~7 200 resolves/sec is nothing on this hardware.
+- The scrub slider doubles as a debugging tool: dragging through the song shows every line transition and the per-character wipe in slow motion. Will keep this slider in stage 2 too as a "seek bar" for development; can hide behind the HUD toggle for the demo.
+- No new dependencies, no entitlements, no Info.plist keys yet. Stage 2 will add `NSAppleMusicUsageDescription` (MusicKit) and Screen Recording permission (ScreenCaptureKit) — both deferred.
+
+**Follow-up (stage 2 outline):**
+- `MusicKitSearch` — wraps `MusicCatalogSearchRequest(term:types:[Song.self])`, returns artwork URL + title + artist + duration + ISRC for the top 8 hits. Search sheet UI as a SwiftUI `.sheet`.
+- `MusicKitPlayer` — `ApplicationMusicPlayer.shared`, queue with selected song, expose `playbackTime` to drive `karaoke.currentTime` (replaces the wall-clock integration).
+- `LRCLibClient` — single `URLSession` GET to `https://lrclib.net/api/get?track_name=...&artist_name=...&duration=...`, JSON-decode `syncedLyrics` (LRC format string), feed straight into the existing `LRCParser`. Fallback to `plainLyrics` (un-synced) → render single static block when no synced version exists.
+- `SystemAudioReactor` — `SCStream` with `SCStreamConfiguration.capturesAudio = true`, audio-only filter; convert delivered `CMSampleBuffer`s to the same `Float` interleaved format the existing mic reactor consumes, then literally call the existing FFT path. HUD toggle "mic / system" to switch reactors live.
+- Optional: per-line "active colour" pulled from the audio reactor's high-band hue rather than always white.
+- Optional: word-level karaoke (some LRCLIB tracks ship `[mm:ss.xx]` *per word*, not per line) — already supported by the parser shape, just needs a second pass to group same-text words back into lines.
+
 ---
 
 ## 2026-05-13 — `particles` branch: blob-tracking bounding-box overlay (replaces rejected tracery)

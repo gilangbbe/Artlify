@@ -54,10 +54,23 @@ nonisolated public final class AudioReactor: @unchecked Sendable {
 
     private let log = Logger(subsystem: "com.biru.Artlify", category: "AudioKit")
 
+    /// Where the analysed audio is coming from. Independent of the
+    /// analysis pipeline — both sources feed the same FFT path.
+    public enum InputSource: String, Sendable {
+        case microphone
+        /// External source — the reactor doesn't own any engine for
+        /// this case; callers push buffers in via `ingest(buffer:)`.
+        /// Used by `AudioFilePlayer` so analysis sees the file's
+        /// audio directly.
+        case audioFile
+    }
+
     // ---- Public state read by the renderer / UI on the main thread.
     public private(set) var latest: AudioFrame = .zero
     public private(set) var isRunning: Bool = false
     public private(set) var lastError: String?
+    /// Currently active source. Use `switchSource(_:)` to change.
+    public private(set) var source: InputSource = .microphone
 
     /// Master input gain. Multiplies the analysed magnitudes before
     /// they're clipped to [0,1] and exposed to the shader.
@@ -112,6 +125,31 @@ nonisolated public final class AudioReactor: @unchecked Sendable {
     // MARK: - Lifecycle
 
     public func start() {
+        switch source {
+        case .microphone:  startMicrophone()
+        case .audioFile:   startAudioFile()
+        }
+    }
+
+    public func stop() {
+        stopMicrophone()
+        // audioFile source has no engine to stop here — the
+        // `AudioFilePlayer` that pushes buffers owns its own lifecycle.
+        latest = .zero
+        isRunning = false
+    }
+
+    /// Switch input source. Tears down the current source and starts
+    /// the new one. Safe to call repeatedly.
+    public func switchSource(_ newSource: InputSource) {
+        guard newSource != source else { return }
+        let wasRunning = isRunning
+        stop()
+        source = newSource
+        if wasRunning { start() }
+    }
+
+    private func startMicrophone() {
         guard !isRunning else { return }
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
@@ -133,21 +171,38 @@ nonisolated public final class AudioReactor: @unchecked Sendable {
             try engine.start()
             isRunning = true
             lastError = nil
-            log.info("AudioReactor started, sampleRate=\(format.sampleRate, privacy: .public) channels=\(format.channelCount, privacy: .public)")
+            log.info("AudioReactor[mic] started, sampleRate=\(format.sampleRate, privacy: .public) channels=\(format.channelCount, privacy: .public)")
         } catch {
             input.removeTap(onBus: 0)
             isRunning = false
             lastError = error.localizedDescription
-            log.error("AudioReactor failed to start: \(error.localizedDescription, privacy: .public)")
+            log.error("AudioReactor[mic] failed to start: \(error.localizedDescription, privacy: .public)")
         }
     }
 
-    public func stop() {
-        guard isRunning else { return }
+    private func stopMicrophone() {
+        guard engine.isRunning else { return }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        isRunning = false
-        latest = .zero
+    }
+
+    /// External-source start: nothing to spin up here, the caller
+    /// (typically `AudioFilePlayer`) pushes buffers via `ingest`. We
+    /// just flip the flag so the HUD reads "audio on".
+    private func startAudioFile() {
+        guard !isRunning else { return }
+        isRunning = true
+        lastError = nil
+        log.info("AudioReactor[audioFile] ready for ingest")
+    }
+
+    /// Public entry point for externally-sourced buffers. Routes
+    /// straight into the same FFT path the mic + system sources use.
+    /// No-op unless the current source is `.audioFile` so a stale
+    /// player can't sneak frames into a different active source.
+    public func ingest(buffer: AVAudioPCMBuffer) {
+        guard source == .audioFile, isRunning else { return }
+        handleTap(buffer: buffer)
     }
 
     // MARK: - Analysis (audio thread → analyzeQueue → main)

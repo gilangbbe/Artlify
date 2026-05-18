@@ -236,6 +236,12 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             return
         }
         latestCameraTexture = tex
+        // Evict stale cache entries so their backing IOSurfaces can
+        // return to the camera's pool. Without this, CMIO eventually
+        // logs `ReceivedSampleBuffer N queue full` because the camera
+        // daemon runs out of pool slots to write the next frame into.
+        // The entry we just created stays live (referenced by `tex`).
+        CVMetalTextureCacheFlush(cache, 0)
     }
 
     // MARK: - Submit (mask)
@@ -260,6 +266,10 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
               let tex = CVMetalTextureGetTexture(cvTex)
         else { return }
         personMaskTexture = tex
+        // Same pool-recycling rationale as `submit(_:)` above — mask
+        // frames also come from a CV-backed pool (Vision's segmentation
+        // output) and benefit from per-submit cache eviction.
+        CVMetalTextureCacheFlush(cache, 0)
     }
 
     // MARK: - Submit (stylized)
