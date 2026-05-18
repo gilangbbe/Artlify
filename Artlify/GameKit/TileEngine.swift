@@ -57,9 +57,10 @@ final class TileEngine {
     let hitZoneY:  Double = 0.72    // target y at note's beat time
     let laneCount: Int    = 4
 
-    /// When true the joint x-axis is flipped (1 − x) before lane
-    /// collision checks, matching the mirrored camera display.
-    var isMirrored: Bool = true
+    /// Leave false when the overlay canvas is inside a scaleEffect(x:-1)
+    /// group — the tile coordinates and joint coordinates are already in
+    /// the same flipped space, so no additional x-flip is needed.
+    var isMirrored: Bool = false
 
     // ---- Dependencies
     let song: TileSong
@@ -197,8 +198,32 @@ final class TileEngine {
                 prevY + (rawY - prevY) * alpha)
     }
 
+    // Joint IDs that belong to the head region in VNHumanBodyPoseObservation.
+    private static let headJointTokens = ["nose", "eye", "ear", "neck"]
+
+    private func isHeadJoint(_ id: String) -> Bool {
+        Self.headJointTokens.contains(where: { id.localizedCaseInsensitiveContains($0) })
+    }
+
+    /// UV position of the head centroid, computed from all sufficiently
+    /// confident head-region joints.  Returns nil when no head is visible.
+    private func headCenter() -> (x: Double, y: Double)? {
+        let headJoints = currJoints.filter { isHeadJoint($0.id) && $0.confidence >= 0.15 }
+        guard !headJoints.isEmpty else { return nil }
+        var sx = 0.0, sy = 0.0
+        for j in headJoints {
+            let (rx, ry) = interpolatedPosition(for: j)
+            sx += rx; sy += ry
+        }
+        let n = Double(headJoints.count)
+        let rawX = sx / n
+        return (x: isMirrored ? 1.0 - rawX : rawX, y: sy / n)
+    }
+
     private func processCollisions() {
         let laneW = 1.0 / Double(laneCount)
+        // Pre-compute head centre once per tick (cheaper than per-tile).
+        let head = headCenter()
 
         for i in activeTiles.indices where activeTiles[i].state == .active {
             let topY   = tileTopY(activeTiles[i])
@@ -216,34 +241,47 @@ final class TileEngine {
                 return   // stop processing remaining tiles this tick
             }
 
-            // Hit: any confident joint inside the tile rect (interpolated position)
             let laneMinX = Double(lane) * laneW
             let laneMaxX = laneMinX + laneW
 
-            for joint in currJoints where joint.confidence >= 0.30 {
-                let (rawJx, jy) = interpolatedPosition(for: joint)
-                // Flip x when mirrored so lane checks match the visual display.
-                let jx = isMirrored ? 1.0 - rawJx : rawJx
+            var didHit = false
 
+            // Body joints: exact point-in-rect check.
+            for joint in currJoints where !isHeadJoint(joint.id) && joint.confidence >= 0.30 {
+                let (rawJx, jy) = interpolatedPosition(for: joint)
+                let jx = isMirrored ? 1.0 - rawJx : rawJx
                 guard jx >= laneMinX, jx <= laneMaxX,
                       jy >= topY,     jy <= topY + height
                 else { continue }
-
-                // Timing accuracy: how close to the "perfect" beat moment
-                let timingErr  = abs(songTime - activeTiles[i].absoluteTargetTime)
-                let accuracy   = max(0.3, 1.0 - timingErr * 1.2)
-                let comboBonus = min(combo / 5, 8)
-                let pts = Int(Double(100) * accuracy) * (1 + comboBonus)
-
-                activeTiles[i].state   = .hit
-                activeTiles[i].hitTime = songTime
-                score      += pts
-                combo      += 1
-                totalHits  += 1
-
-                notePlayer.play(lane: lane, velocity: UInt8(62 + Int(accuracy * 32)))
-                break   // one joint hit is enough
+                didHit = true
+                break
             }
+
+            // Head: centroid with a horizontal padding so you don't need
+            // pixel-perfect lane alignment.  ±4 % UV ≈ one finger-width.
+            if !didHit, let (hx, hy) = head {
+                let pad = 0.04
+                if hx >= laneMinX - pad, hx <= laneMaxX + pad,
+                   hy >= topY,           hy <= topY + height {
+                    didHit = true
+                }
+            }
+
+            guard didHit else { continue }
+
+            // Timing accuracy: how close to the "perfect" beat moment
+            let timingErr  = abs(songTime - activeTiles[i].absoluteTargetTime)
+            let accuracy   = max(0.3, 1.0 - timingErr * 1.2)
+            let comboBonus = min(combo / 5, 8)
+            let pts = Int(Double(100) * accuracy) * (1 + comboBonus)
+
+            activeTiles[i].state   = .hit
+            activeTiles[i].hitTime = songTime
+            score      += pts
+            combo      += 1
+            totalHits  += 1
+
+            notePlayer.play(lane: lane, velocity: UInt8(62 + Int(accuracy * 32)))
         }
     }
 

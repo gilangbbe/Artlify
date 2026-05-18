@@ -181,10 +181,9 @@ struct ContentView: View {
             // each tracked body point's bounding box follows the body.
             updateBlobs()
         }
-        // Keep mirror flag in sync if the user toggles it mid-game.
-        .onChange(of: mirrorEnabled) { _, newVal in
-            gameEngine?.isMirrored = newVal
-        }
+        // Mirror is handled by scaleEffect on the parent ZStack.
+        // TileEngine.isMirrored stays false — no additional joint flip needed.
+        .onChange(of: mirrorEnabled) { _, _ in }
         // Universe Tune: drive the tile engine at 60 Hz.
         // Joint data is read from vision.latestFrame — stale between
         // Vision passes (~15 Hz) but the tile physics still advance
@@ -685,7 +684,6 @@ struct ContentView: View {
 
     private func startGame(song: TileSong) {
         let engine = TileEngine(song: song)
-        engine.isMirrored = mirrorEnabled
         engine.start()
         gameEngine = engine
         gameModeOn = true

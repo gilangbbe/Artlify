@@ -33,10 +33,14 @@ struct UniverseTuneOverlay: View {
             .allowsHitTesting(false)
             .drawingGroup()
 
+            // Counter-mirror: the parent ZStack has scaleEffect(x:-1),
+            // so apply the inverse here to keep text readable.
             if engine.isGameOver {
                 gameOverScreen
+                    .scaleEffect(x: -1, y: 1)
             } else {
                 scoreHUD
+                    .scaleEffect(x: -1, y: 1)
             }
         }
         .onReceive(timer) { _ in now = CFAbsoluteTimeGetCurrent() }
