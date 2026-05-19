@@ -19,6 +19,19 @@ Each milestone produces a **runnable, demoable build**. We do not start the next
 
 ---
 
+## Recently shipped (2026-05-19)
+
+| Item                                                                                                       | Status   | Notes |
+| ---------------------------------------------------------------------------------------------------------- | -------- | ----- |
+| Selfie-mirror at capture (`AVCaptureConnection.isVideoMirrored`)                                            | shipped  | Vision + all renderer passes see the already-mirrored buffer; no per-pass coord flips needed. |
+| Multi-person body pose (up to 4 simultaneous bodies, `VisionJoint.personIndex`)                            | shipped  | Blob + neg-box bookkeeping namespaced by `"p<idx>/<jointName>"`. Karaoke head still tracks person 0. |
+| Background scrim (`ColorPicker` + opacity, between camera and overlays)                                     | shipped  | SwiftUI Color layer in the ZStack — not `MTLClearColor`-based. |
+| ASCII counter-depth background (`Artlify/AppShell/AsciiDepthBackground.swift`)                              | shipped  | `TimelineView` @ 24 Hz + `.drawingGroup()`; per-row `ctx.draw(Text)`; 5 knobs (hue/sat/bright/density/collapse). |
+| Production HUD: thin top toolbar + Art / Music popovers + inline Camera menu                                | shipped  | Replaces three colliding free-floating cards. `topBar(field:)` / `statusPill` / `toolbarButtons(field:)` / `artMenuContent(field:)` / `musicMenuContent` / `sectionCard(title:icon:_:)`. |
+| Cleanup: delete `karaokeRow_unused`, `backgroundPanel`, `statusHUD`, `particlePanel(field:)` dead helpers   | pending  | Left in place for review of the HUD refactor diff; harmless private dead code. |
+
+---
+
 ## Backlog
 
 ### P0 — Blockers / unknowns to resolve before committing further

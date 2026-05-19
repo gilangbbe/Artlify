@@ -121,6 +121,13 @@ struct ContentView: View {
     @State private var asciiDepthDensity: Double = 0.45
     @State private var asciiDepthCollapse: Double = 0.75
 
+    /// Pop-over presentation flags for the two production-ready
+    /// menus exposed from the top bar. Replaces the three loose
+    /// HUD cards (status / background / particle) that collided
+    /// at small window sizes with one bar + two on-demand menus.
+    @State private var showArtMenu: Bool = false
+    @State private var showMusicMenu: Bool = false
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             CameraMetalView(renderer: session.renderer)
@@ -199,28 +206,7 @@ struct ContentView: View {
             }
 
             if showHUD {
-                statusHUD
-                    .padding(12)
-
-                // Top-right: background scrim + ASCII counter-depth
-                // controls. Lives in its own column so it never
-                // crowds the device / Vision row on the left.
-                VStack {
-                    HStack {
-                        Spacer()
-                        backgroundPanel
-                            .padding(12)
-                    }
-                    Spacer()
-                }
-
-                VStack {
-                    Spacer()
-                    if let field {
-                        particlePanel(field: field)
-                            .padding(12)
-                    }
-                }
+                topBar(field: field)
             }
         }
         .frame(minWidth: 720, minHeight: 480)
@@ -412,79 +398,170 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Top-left status
+    // MARK: - Top bar HUD (production layout)
 
+    /// Single thin bar pinned to the top of the window. Replaces the
+    /// earlier collection of three free-floating cards (status / bg /
+    /// particle) so panels can never collide and the live image stays
+    /// uncluttered. Status info on the left, toolbar buttons on the
+    /// right; the heavy controls live behind two popovers (`Art` and
+    /// `Music`) opened from this bar.
     @ViewBuilder
-    private var statusHUD: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(LinearGradient(
-                        colors: [.orange, .pink],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing))
-                    .frame(width: 8, height: 8)
-                Text("ARTLIFY")
-                    .font(.system(.caption, design: .monospaced).weight(.bold))
-                    .tracking(2.4)
-                    .foregroundStyle(.primary)
-                Text(statusText)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
+    private func topBar(field: ParticleField?) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                statusPill
+                Spacer(minLength: 8)
+                toolbarButtons(field: field)
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(.white.opacity(0.08))
+                            .frame(height: 0.5)
+                    }
+                    .shadow(color: .black.opacity(0.25), radius: 6, x: 0, y: 2)
+            )
+            Spacer()
+        }
+        .ignoresSafeArea(.container, edges: .top)
+        .foregroundStyle(.white)
+    }
+
+    /// Left-aligned ARTLIFY brand + live status + active device + a
+    /// now-playing pill so the user can read transport state at a
+    /// glance without opening the music menu.
+    @ViewBuilder
+    private var statusPill: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(LinearGradient(
+                    colors: [.orange, .pink],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing))
+                .frame(width: 8, height: 8)
+            Text("ARTLIFY")
+                .font(.system(.caption, design: .monospaced).weight(.bold))
+                .tracking(2.4)
+            Text(statusText)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
             if let device = session.activeDeviceName {
-                Text("device  ·  \(device)")
+                Text("·").foregroundStyle(.tertiary)
+                Text(device)
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 180)
             }
             visionStatusLine
-            HStack(spacing: 6) {
-                if !session.availableDevices.isEmpty {
-                    Menu {
-                        ForEach(session.availableDevices) { dev in
-                            Button {
-                                session.reconnect(deviceID: dev.id)
-                            } label: {
-                                Label(dev.localizedName,
-                                      systemImage: dev.isContinuityCamera ? "iphone" : "camera")
-                            }
-                        }
-                    } label: {
-                        Label("Camera", systemImage: "camera.rotate")
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
+            if let title = currentTrackTitle {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(karaokePlaying ? Color.green : Color.secondary)
+                        .frame(width: 6, height: 6)
+                    Text(title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 200)
                 }
-                Button { session.reconnect() } label: {
-                    Label("Reconnect", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                Toggle(isOn: $showVisionOverlay) {
-                    Label("Vision", systemImage: "figure.stand")
-                }
-                .toggleStyle(.button)
-                .controlSize(.small)
-                Button {
-                    toggleFullscreen()
-                } label: {
-                    Label("Fullscreen", systemImage: "arrow.up.left.and.arrow.down.right")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.primary.opacity(0.08))
+                )
             }
         }
-        .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(.white.opacity(0.10), lineWidth: 0.5)
-                )
-                .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 4)
-        )
-        .foregroundStyle(.white)
+    }
+
+    /// Right-aligned button cluster: camera picker, Art popover,
+    /// Music popover, Vision overlay toggle, fullscreen, hide-HUD.
+    /// Every heavy control lives behind one of the two popovers so
+    /// the bar itself stays one row tall at any window size.
+    @ViewBuilder
+    private func toolbarButtons(field: ParticleField?) -> some View {
+        HStack(spacing: 8) {
+            if !session.availableDevices.isEmpty {
+                Menu {
+                    ForEach(session.availableDevices) { dev in
+                        Button {
+                            session.reconnect(deviceID: dev.id)
+                        } label: {
+                            Label(dev.localizedName,
+                                  systemImage: dev.isContinuityCamera ? "iphone" : "camera")
+                        }
+                    }
+                    Divider()
+                    Button {
+                        session.reconnect()
+                    } label: {
+                        Label("Reconnect", systemImage: "arrow.clockwise")
+                    }
+                } label: {
+                    Label("Camera", systemImage: "camera.rotate")
+                }
+                .menuStyle(.borderlessButton)
+                .controlSize(.small)
+                .fixedSize()
+            }
+
+            Button {
+                showArtMenu.toggle()
+            } label: {
+                Label("Art", systemImage: "paintpalette.fill")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .popover(isPresented: $showArtMenu, arrowEdge: .top) {
+                artMenuContent(field: field)
+                    .frame(width: 460, height: 580)
+            }
+
+            Button {
+                showMusicMenu.toggle()
+            } label: {
+                Label("Music", systemImage: "music.note.list")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .popover(isPresented: $showMusicMenu, arrowEdge: .top) {
+                musicMenuContent
+                    .frame(width: 520, height: 380)
+            }
+
+            Toggle(isOn: $showVisionOverlay) {
+                Image(systemName: "figure.stand")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .help("Toggle Vision pose overlay (joints + skeleton)")
+
+            Button {
+                toggleFullscreen()
+            } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Toggle fullscreen")
+
+            Button {
+                showHUD = false
+            } label: {
+                Image(systemName: "eye.slash")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Hide HUD (press H to bring it back)")
+        }
     }
 
     private var statusText: String {
@@ -511,11 +588,145 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Bottom particle panel
+    // MARK: - Art menu (popover content)
+
+    /// Full art-controls menu shown inside the Art popover. Every
+    /// visual subsystem (background scrim, ASCII depth field,
+    /// particle field, trails, silhouette ASCII, neg boxes, blobs,
+    /// open-hand flash, audio reactor, karaoke layers) gets its own
+    /// section card so the user can scroll without losing context
+    /// of which subsystem they're tuning.
+    @ViewBuilder
+    private func artMenuContent(field: ParticleField?) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "paintpalette.fill")
+                    .foregroundStyle(.orange)
+                Text("ART CONTROLS")
+                    .font(.system(.callout, design: .monospaced).weight(.semibold))
+                    .tracking(1.4)
+                Spacer()
+                Text("press H to hide HUD")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    backgroundSection
+                    asciiDepthSection
+                    if let field { particleSection(field: field) }
+                    trailsSection
+                    silhouetteAsciiSection
+                    negBoxesSection
+                    blobsSection
+                    negFlashCard
+                    if let field { audioSection(field: field) }
+                }
+                .padding(14)
+            }
+        }
+        .background(.background)
+    }
+
+    /// Lightweight per-section card wrapper used inside the Art
+    /// menu. Mirrors the chrome of `negFlashCard` so every section
+    /// reads as part of one family.
+    @ViewBuilder
+    private func sectionCard<Content: View>(
+        title: String,
+        icon: String,
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+                Text(title)
+                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            content()
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.white.opacity(0.08), lineWidth: 0.5)
+                )
+        )
+    }
 
     @ViewBuilder
-    private func particlePanel(field: ParticleField) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private var backgroundSection: some View {
+        sectionCard(title: "BACKGROUND SCRIM", icon: "rectangle.fill") {
+            HStack(spacing: 10) {
+                ColorPicker("color",
+                            selection: $bgColor,
+                            supportsOpacity: false)
+                    .labelsHidden()
+                    .frame(width: 28, height: 18)
+                flashSlider(label: "opacity",
+                            value: $bgOpacity,
+                            range: 0...1,
+                            fmt: "%.2f")
+                Spacer()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var asciiDepthSection: some View {
+        sectionCard(title: "ASCII COUNTER-DEPTH", icon: "scope") {
+            HStack {
+                Toggle("enabled", isOn: $asciiDepthEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                Spacer()
+            }
+            if asciiDepthEnabled {
+                HStack(spacing: 14) {
+                    flashSlider(label: "hue",
+                                value: $asciiDepthHue,
+                                range: 0...1, fmt: "%.2f")
+                    flashSlider(label: "sat",
+                                value: $asciiDepthSaturation,
+                                range: 0...1, fmt: "%.2f")
+                    Circle()
+                        .fill(Color(hue: asciiDepthHue,
+                                    saturation: asciiDepthSaturation,
+                                    brightness: 1.0))
+                        .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+                        .frame(width: 18, height: 18)
+                }
+                HStack(spacing: 14) {
+                    flashSlider(label: "bright",
+                                value: $asciiDepthBrightness,
+                                range: 0...1, fmt: "%.2f")
+                    flashSlider(label: "density",
+                                value: $asciiDepthDensity,
+                                range: 0...1, fmt: "%.2f")
+                    flashSlider(label: "collapse",
+                                value: $asciiDepthCollapse,
+                                range: 0...1, fmt: "%.2f")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func particleSection(field: ParticleField) -> some View {
+        sectionCard(title: "PARTICLE FIELD", icon: "circle.dotted") {
             HStack {
                 Toggle("particles", isOn: Binding(
                     get: { field.enabled },
@@ -541,95 +752,95 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
-
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 slider(label: "attraction",
                        value: Binding(get: { field.attraction },
                                       set: { field.attraction = $0 }),
-                       range: 0...5,
-                       fmt: "%.2f")
+                       range: 0...5, fmt: "%.2f")
                 slider(label: "flow",
                        value: Binding(get: { field.flow },
                                       set: { field.flow = $0 }),
-                       range: 0...2,
-                       fmt: "%.2f")
+                       range: 0...2, fmt: "%.2f")
+            }
+            HStack(spacing: 12) {
                 slider(label: "swirl",
                        value: Binding(get: { field.flowScale },
                                       set: { field.flowScale = $0 }),
-                       range: 1...20,
-                       fmt: "%.1f")
+                       range: 1...20, fmt: "%.1f")
                 slider(label: "damping",
                        value: Binding(get: { field.damping },
                                       set: { field.damping = $0 }),
-                       range: 0.5...0.999,
-                       fmt: "%.3f")
+                       range: 0.5...0.999, fmt: "%.3f")
             }
-
-            HStack(spacing: 16) {
+            HStack(spacing: 12) {
                 slider(label: "size",
                        value: Binding(get: { field.pointSize },
                                       set: { field.pointSize = $0 }),
-                       range: 1...14,
-                       fmt: "%.1f")
+                       range: 1...14, fmt: "%.1f")
                 slider(label: "glow",
                        value: Binding(get: { field.glow },
                                       set: { field.glow = $0 }),
-                       range: 0.1...3,
-                       fmt: "%.2f")
+                       range: 0.1...3, fmt: "%.2f")
+            }
+            HStack(spacing: 12) {
                 slider(label: "hue",
                        value: Binding(get: { field.hueShift },
                                       set: { field.hueShift = $0 }),
-                       range: 0...1,
-                       fmt: "%.2f")
+                       range: 0...1, fmt: "%.2f")
                 slider(label: "mask gate",
                        value: Binding(get: { field.maskGate },
                                       set: { field.maskGate = $0 }),
-                       range: 0...1,
-                       fmt: "%.2f")
+                       range: 0...1, fmt: "%.2f")
             }
-
             HStack(spacing: 12) {
-                Text("trails")
+                Text("count")
                     .font(.caption)
-                Slider(value: Binding(
-                    get: { session.renderer.trailDecay },
-                    set: { session.renderer.trailDecay = $0 }
-                ), in: 0.80...0.995)
-                    .frame(width: 140)
-                Text(String(format: "%.3f", session.renderer.trailDecay))
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                Toggle("trails on", isOn: Binding(
+                Picker("count", selection: Binding(
+                    get: { field.count },
+                    set: { field.count = $0 }
+                )) {
+                    ForEach([10_000, 30_000, 60_000, 120_000], id: \.self) { n in
+                        Text(n.formatted()).tag(n)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                Spacer()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var trailsSection: some View {
+        sectionCard(title: "TRAILS", icon: "wind") {
+            HStack(spacing: 12) {
+                Toggle("enabled", isOn: Binding(
                     get: { session.renderer.trailsEnabled },
                     set: { session.renderer.trailsEnabled = $0 }
                 ))
                 .toggleStyle(.button)
                 .controlSize(.small)
-                Spacer()
-            }
-
-            HStack(spacing: 12) {
-                Toggle("neg boxes", isOn: Binding(
-                    get: { session.renderer.negativeBoxesEnabled },
-                    set: { session.renderer.negativeBoxesEnabled = $0 }
-                ))
-                .toggleStyle(.button)
-                .controlSize(.small)
-                Text("intensity")
+                Text("decay")
                     .font(.caption)
                 Slider(value: Binding(
-                    get: { session.renderer.negativeBoxesPeak },
-                    set: { session.renderer.negativeBoxesPeak = $0 }
-                ), in: 0.1...1.0)
-                    .frame(width: 140)
-                Text(String(format: "%.2f", session.renderer.negativeBoxesPeak))
+                    get: { session.renderer.trailDecay },
+                    set: { session.renderer.trailDecay = $0 }
+                ), in: 0.80...0.995)
+                    .frame(width: 160)
+                Text(String(format: "%.3f", session.renderer.trailDecay))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
                 Spacer()
             }
+        }
+    }
 
+    @ViewBuilder
+    private var silhouetteAsciiSection: some View {
+        sectionCard(title: "SILHOUETTE ASCII", icon: "textformat") {
             HStack(spacing: 12) {
-                Toggle("ascii", isOn: Binding(
+                Toggle("enabled", isOn: Binding(
                     get: { session.renderer.asciiEnabled },
                     set: { session.renderer.asciiEnabled = $0 }
                 ))
@@ -641,10 +852,13 @@ struct ContentView: View {
                     get: { session.renderer.asciiCellSize },
                     set: { session.renderer.asciiCellSize = $0 }
                 ), in: 4...28)
-                    .frame(width: 120)
-                Text(String(format: "%.0f", session.renderer.asciiCellSize) + " px")
+                    .frame(width: 110)
+                Text(String(format: "%.0f px", session.renderer.asciiCellSize))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
+                Spacer()
+            }
+            HStack(spacing: 12) {
                 Text("hue")
                     .font(.caption)
                 Slider(value: Binding(
@@ -654,7 +868,7 @@ struct ContentView: View {
                         applyAsciiHue(newVal)
                     }
                 ), in: 0...1)
-                    .frame(width: 110)
+                    .frame(width: 140)
                 Circle()
                     .fill(Color(hue: asciiHue, saturation: 0.7, brightness: 1.0))
                     .frame(width: 14, height: 14)
@@ -669,7 +883,37 @@ struct ContentView: View {
                 .controlSize(.small)
                 Spacer()
             }
+        }
+    }
 
+    @ViewBuilder
+    private var negBoxesSection: some View {
+        sectionCard(title: "NEG BOXES", icon: "square.dashed") {
+            HStack(spacing: 12) {
+                Toggle("enabled", isOn: Binding(
+                    get: { session.renderer.negativeBoxesEnabled },
+                    set: { session.renderer.negativeBoxesEnabled = $0 }
+                ))
+                .toggleStyle(.button)
+                .controlSize(.small)
+                Text("intensity")
+                    .font(.caption)
+                Slider(value: Binding(
+                    get: { session.renderer.negativeBoxesPeak },
+                    set: { session.renderer.negativeBoxesPeak = $0 }
+                ), in: 0.1...1.0)
+                    .frame(width: 160)
+                Text(String(format: "%.2f", session.renderer.negativeBoxesPeak))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var blobsSection: some View {
+        sectionCard(title: "BLOB BOXES", icon: "viewfinder") {
             HStack(spacing: 12) {
                 Toggle("blobs", isOn: $blobsEnabled)
                     .toggleStyle(.button)
@@ -680,78 +924,231 @@ struct ContentView: View {
                 Toggle("strings", isOn: $blobsStrings)
                     .toggleStyle(.button)
                     .controlSize(.small)
+                Spacer()
+            }
+            HStack(spacing: 12) {
                 Text("flash")
                     .font(.caption)
                 Slider(value: Binding(
                     get: { blobs.flashProbability },
                     set: { blobs.flashProbability = $0 }
                 ), in: 0.05...0.8)
-                    .frame(width: 110)
+                    .frame(width: 130)
                 Text(String(format: "%.2f", blobs.flashProbability))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 12) {
                 Text("intensity")
                     .font(.caption)
                 Slider(value: $blobsIntensity, in: 0.2...1.5)
-                    .frame(width: 110)
+                    .frame(width: 130)
                 Text(String(format: "%.2f", blobsIntensity))
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
                 Spacer()
             }
-
-            karaokeRow
-
-            negFlashCard
-
-            HStack(spacing: 12) {
-                Toggle("layer 3 lyric", isOn: $karaokeCurrentLineEnabled)
-                    .toggleStyle(.button)
-                    .controlSize(.small)
-                    .help("Toggle the big chromatic current-line text in the karaoke overlay. Off keeps the quieter background layers.")
-                Spacer()
-            }
-
-            audioRow(field: field)
-
-            HStack(spacing: 12) {
-                Text("count")
-                    .font(.caption)
-                Picker("count", selection: Binding(
-                    get: { field.count },
-                    set: { field.count = $0 }
-                )) {
-                    ForEach([10_000, 30_000, 60_000, 120_000], id: \.self) { n in
-                        Text(n.formatted()).tag(n)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .fixedSize()
-                .labelsHidden()
-                Spacer()
-                Text("press H to hide HUD")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.tertiary)
-            }
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(.white.opacity(0.10), lineWidth: 0.5)
-                )
-                .shadow(color: .black.opacity(0.40), radius: 16, x: 0, y: 6)
-        )
-        .foregroundStyle(.white)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: - Karaoke HUD row (stage 1: sample LRC + scrub slider)
+    @ViewBuilder
+    private func audioSection(field: ParticleField) -> some View {
+        sectionCard(title: "AUDIO REACTOR", icon: "waveform") {
+            audioRow(field: field)
+        }
+    }
+
+    // MARK: - Music menu (popover content)
+
+    /// Combined music + karaoke transport. Replaces the wide flat
+    /// `karaokeRow` of the old HUD with a proper vertical layout:
+    /// now-playing → loaders → transport → scrub → overlay toggles.
+    /// Designed to fit cleanly inside a ~520×380 popover.
+    @ViewBuilder
+    private var musicMenuContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Image(systemName: "music.note.list")
+                    .foregroundStyle(.purple)
+                Text("MUSIC & KARAOKE")
+                    .font(.system(.callout, design: .monospaced).weight(.semibold))
+                    .tracking(1.4)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 14) {
+                // Now-playing badge (full-width).
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(karaokePlaying ? Color.green : Color.secondary)
+                        .frame(width: 8, height: 8)
+                    Text(currentTrackTitle ?? "No track loaded")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(currentTrackTitle == nil ? .secondary : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                }
+
+                // Track loaders.
+                HStack(spacing: 8) {
+                    Button {
+                        showMusicSearch = true
+                    } label: {
+                        Label("Search", systemImage: "magnifyingglass")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    Button {
+                        loadAudioFile()
+                    } label: {
+                        Label("Open File", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button {
+                        karaoke.loadSample()
+                        currentTrackTitle = karaoke.track?.title ?? "Sample"
+                        karaokeEnabled = true
+                        karaokePlaying = true
+                        karaokeLastTick = CFAbsoluteTimeGetCurrent()
+                    } label: {
+                        Label("Sample", systemImage: "music.note")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Spacer()
+                }
+
+                Divider().opacity(0.3)
+
+                // Transport row.
+                HStack(spacing: 12) {
+                    Button {
+                        karaokePlaying.toggle()
+                        karaokeLastTick = CFAbsoluteTimeGetCurrent()
+                        if musicKit.isActive {
+                            if karaokePlaying { musicKit.resume() }
+                            else              { musicKit.pause() }
+                        } else if audioFile.fileURL != nil {
+                            if karaokePlaying { audioFile.play() }
+                            else              { audioFile.pause() }
+                        }
+                    } label: {
+                        Image(systemName: karaokePlaying ? "pause.fill" : "play.fill")
+                            .frame(width: 20)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(karaoke.track == nil && !musicKit.isActive)
+                    Button {
+                        karaokePlaying = false
+                        musicKit.stop()
+                        audioFile.stop()
+                        karaoke.clear()
+                        currentTrackTitle = nil
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .frame(width: 20)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(karaoke.track == nil && !musicKit.isActive)
+
+                    Text(timecode(musicKit.isActive ? musicKit.currentTime : karaoke.currentTime))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                    Text("/ \(timecode(trackDuration))")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.tertiary)
+                    Spacer()
+                }
+
+                Slider(value: Binding(
+                    get: {
+                        if musicKit.isActive { return musicKit.currentTime }
+                        return karaoke.currentTime
+                    },
+                    set: { newVal in
+                        karaoke.currentTime = newVal
+                        if musicKit.isActive {
+                            musicKit.seek(to: newVal)
+                        } else if audioFile.fileURL != nil {
+                            audioFile.seek(to: newVal)
+                        }
+                    }
+                ), in: 0...max(0.01, trackDuration))
+                .disabled(karaoke.track == nil && !musicKit.isActive)
+
+                Divider().opacity(0.3)
+
+                // Karaoke overlay toggles.
+                HStack(spacing: 8) {
+                    Toggle("karaoke", isOn: $karaokeEnabled)
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                        .onChange(of: karaokeEnabled) { _, on in
+                            if !on { karaokePlaying = false }
+                        }
+                    Toggle("head blob", isOn: $headBlobEnabled)
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                    Toggle("layer 3 lyric", isOn: $karaokeCurrentLineEnabled)
+                        .toggleStyle(.button)
+                        .controlSize(.small)
+                        .help("Toggle the big chromatic current-line text in the karaoke overlay.")
+                    Spacer()
+                }
+            }
+            .padding(14)
+            Spacer()
+        }
+        .background(.background)
+    }
+
+    /// Convenience: total duration of whichever player owns the
+    /// timeline. Falls back to a sentinel small value so the scrub
+    /// slider stays a no-op (instead of crashing on a 0-length range)
+    /// when nothing is loaded.
+    private var trackDuration: TimeInterval {
+        if musicKit.isActive {
+            return max(musicKit.duration, karaoke.track?.duration ?? 0)
+        }
+        return karaoke.track?.duration ?? 0
+    }
+
+    /// Open-panel + load-file flow extracted from the old karaoke
+    /// row so the music menu's "Open File" button can call the same
+    /// path without duplicating the error-surfacing logic.
+    private func loadAudioFile() {
+        guard let url = AudioFilePlayer.runOpenPanel() else { return }
+        do {
+            musicKit.stop()
+            try audioFile.load(url: url)
+            audio.switchSource(.audioFile)
+            if !audio.isRunning { audio.start() }
+            karaokeEnabled = true
+            karaokePlaying = true
+            audioFile.play()
+            if karaoke.track == nil {
+                karaoke.loadSample()
+            }
+            currentTrackTitle = audioFile.fileName
+            karaokeLastTick = CFAbsoluteTimeGetCurrent()
+        } catch {
+            currentTrackTitle = "⚠︎ \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - (legacy, retained for use in the music menu)
 
     @ViewBuilder
-    private var karaokeRow: some View {
+    private var karaokeRow_unused: some View {
         HStack(spacing: 12) {
             Toggle("karaoke", isOn: $karaokeEnabled)
                 .toggleStyle(.button)

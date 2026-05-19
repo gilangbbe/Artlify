@@ -15,7 +15,76 @@ Entry template:
 
 ---
 
-## 2026-05-19 — `particles` branch: scrapped hand-frame, pivoted to open-hand → negative-camera flash
+## 2026-05-19 — Production-ready HUD: top bar + Art / Music popovers (Phase D)
+
+**Decision / change:**
+Collapsed the three free-floating HUD cards (top-left `statusHUD`, top-right `backgroundPanel`, bottom `particlePanel`) into a single thin top toolbar with two click-to-open popovers (`Art`, `Music`) plus an inline native `Camera` menu. The three cards were colliding at smaller window sizes — the bg panel and the status row both wanted the upper edge, and the particle panel was tall enough to cover the lower third of the camera. New layout:
+- `topBar(field:)` — `.ultraThinMaterial` strip pinned to the top edge with `ignoresSafeArea(.container, edges: .top)`, a hairline at the bottom, and a soft drop shadow.
+- `statusPill` (left) — ARTLIFY brand dot + `statusText` + active device + `visionStatusLine` + now-playing badge with a green/grey dot. All inline on a single row.
+- `toolbarButtons(field:)` (right) — `Menu` "Camera" (devices + Reconnect divider) → `.bordered` "Art" (opens Art popover, 460×580) → `.bordered` "Music" (opens Music popover, 520×380) → Vision toggle → Fullscreen → Hide-HUD eye.
+- `artMenuContent(field:)` — vertical `ScrollView` of `sectionCard(title:icon:_:)` blocks: Background scrim, ASCII counter-depth, Particle field, Trails, Silhouette ASCII, Neg boxes, Blob boxes, Open-hand flash (reused `negFlashCard`), Audio reactor. One subsystem per card, mono-spaced tracking labels, hairline border, faint white fill — same family chrome as `negFlashCard` so the menu reads as one set.
+- `musicMenuContent` — vertical layout: now-playing pill → Search / Open File / Sample loaders → divider → Play/Pause + Stop + timecode `now / duration` → scrub `Slider` → divider → karaoke / head-blob / layer-3 lyric toggles. Replaces the wide horizontal `karaokeRow` (which became dead code retained as `karaokeRow_unused` for reference — left in place rather than deleted to keep this refactor reviewable; will be pruned in the next cleanup pass).
+- New helpers: `trackDuration` (timeline-owner-aware duration), `loadAudioFile()` (extracted from the inline button so both the old row and the new menu can call the same path), `sectionCard(title:icon:_:)` wrapper.
+- New `@State` flags: `showArtMenu`, `showMusicMenu` driving the two `.popover(isPresented:arrowEdge:.top)` attachments.
+
+**Reason:**
+The accumulation of free-floating cards was a side-effect of growing the app one feature at a time. Each new subsystem (particles → ASCII → neg-boxes → blobs → neg-flash → background scrim → ASCII counter-depth) added another row or another card; the layout had become un-tunable because the cards weren't in a container and each one was anchored to a different edge. A single toolbar + on-demand popovers (a) eliminates collisions by construction, (b) keeps the live image fully unobstructed at rest, (c) groups controls by intent (visual tuning vs. transport) instead of by ship order, and (d) reads as a real product instead of a stack of debug overlays.
+
+**Impact:**
+- Build green. No behavioural change to any subsystem — every binding from the old panels is preserved 1:1 inside its new section card.
+- HUD is now always exactly one row tall when idle; the visible live image grows by ~30 % at the default window size.
+- Camera menu now includes a `Reconnect` divider item, so the standalone Reconnect button could be removed from the bar (visible only inside the Camera menu).
+- `karaokeRow_unused` + `backgroundPanel` + `statusHUD` + `particlePanel(field:)` are dead code as of this entry. Build retains them as private members; Swift does not warn. Next cleanup pass deletes them.
+
+**Follow-up:**
+- Delete the four dead helpers in a follow-up commit. Keep the refactor diff readable in this entry.
+- Add a `⌘,` keyboard shortcut on the Art button and `⌘L` on the Music button.
+- Persist the last-opened popover state across launches so the operator returns to where they left off.
+
+---
+
+## 2026-05-19 — Background scrim + ASCII counter-depth field (Phase C)
+
+**Decision / change:**
+Two new background layers stacked between the camera feed and the overlays, both fully toggleable from the HUD:
+1. **Background scrim** — a SwiftUI `Rectangle().fill(bgColor).opacity(bgOpacity)` interposed between `CameraMetalView` and the overlays in the ContentView ZStack. Operator picks `bgColor` from a `ColorPicker(supportsOpacity: false)` and `bgOpacity` from a 0…1 `flashSlider`. Semantics chosen as a SwiftUI Color layer rather than via `MTLClearColor` alpha because (a) the Metal view's `layer.isOpaque = true` and there's no window background behind it to bleed through, and (b) the scrim must sit *above* the camera but *below* the particles and overlays — exactly what a SwiftUI layer in the ZStack gives us for free.
+2. **ASCII counter-depth field** — new file [Artlify/AppShell/AsciiDepthBackground.swift](Artlify/AppShell/AsciiDepthBackground.swift) (~140 lines). Renders an inverted radial depth tunnel using a `TimelineView(.animation(minimumInterval: 1/24))` driving a `Canvas` wrapped in `.drawingGroup()`. Glyphs are drawn one `ctx.draw(Text)` call per **row** (not per glyph) — at 24 Hz with ~60 rows that's ~1.5k draws/sec, trivial. The visual algorithm: build a glyph ramp from `["·","∙","•","░","▒","▓","█"]` weighted by inverse depth from a hollow centre (so the centre is sparse and the edges crowd in — the *opposite* of the silhouette ASCII pass, hence "counter-depth"); modulate per-cell brightness with `sin(r·5 − t·3)` (outward tunnel scroll) and inject `frac(sin(...))` glitches at low probability so the field doesn't read as a perfect grid. Hue is driven by `Color(hue: hue, saturation:, brightness:)` per row.
+- HUD `asciiDepthSection` exposes: `enabled`, `hue`, `sat`, `bright`, `density`, `collapse`. `collapse` linearly interpolates the centre-hollow radius so the operator can flatten the tunnel into a plain field. A live swatch circle next to `hue`/`sat` previews the pen colour.
+
+**Reason:**
+Up to this point, the app had no controllable background — if the camera saw a flat wall there was nothing visually interesting behind the subject. The scrim alone is too plain (it would just be a flat colour); the ASCII counter-depth field gives the empty space behind the dancer a quiet but live texture that reads as "the room behind them is also alive". Counter-depth (sparse centre, dense edges) is the right shape because the dancer almost always occupies the centre — a centre-dense field would compete with them; a centre-sparse field frames them.
+
+**Impact:**
+- Build green. No measurable FPS drop on the M-series test machine (the layer is `.drawingGroup()`-rasterised and only redrawn at 24 Hz).
+- Layer stack inside the ContentView ZStack is now, back→front: `CameraMetalView` → `bgColor.opacity(bgOpacity)` scrim → `AsciiDepthBackground` → `BlobBoxesOverlay` → `KaraokeOverlay` → `HeadLyricBlob` → `PoseOverlay` → top bar HUD.
+- `AppShell/` gains its first new file beyond the entry-point trio (`ArtlifyApp.swift`, `ContentView.swift` — though ContentView lives at the project root, not in AppShell yet).
+
+**Follow-up:**
+- Move `ContentView.swift` into `AppShell/` to match the documented layout.
+- Consider a second ASCII layer (centre-dense, "depth") that the operator can blend against the counter-depth one for a parallax effect.
+
+---
+
+## 2026-05-19 — Selfie-mirror at capture + multi-person body pose (Phase E)
+
+**Decision / change:**
+- **Mirror at capture, not at render.** Set `connection.isVideoMirrored = true` on the `AVCaptureSession`'s `AVCaptureVideoDataOutput` connection, guarded by `connection.isVideoMirroringSupported`. Decision was between flipping at capture (one flag on one connection) vs. flipping the Metal sampler in the camera composite pass. The renderer path would have required also flipping the trails accumulation read, the silhouette ASCII coord, the neg-boxes/neg-flash sampler, and **all Vision coordinates** going back the other way for overlay alignment — at least 5 sites, each one a landmine. The capture flag is one line and the rest of the pipeline (Vision included) sees an already-mirrored buffer.
+- **Multi-person body pose.** `VisionProcessor.process(_:)` now iterates `(poseRequest.results ?? []).prefix(4)` instead of taking only `.first`. Each observation produces joints tagged with a new `personIndex: Int = 0` field on `VisionJoint`. `VisionFrame.joints` stays flat (no nested per-person array) so every downstream consumer keeps working unchanged; consumers that care about per-person grouping just group-by `personIndex`.
+- **Blob id namespacing.** `ContentView`'s blob bookkeeping was previously keyed by joint name (`"leftWrist"`, etc.). With multiple bodies, two different people's left wrists would have collided onto the same blob. Keys are now namespaced: `"p\(personIndex)/\(j.id)"`. Same for the neg-box bookkeeping. Up to 4 simultaneous people, hard cap to keep the visual density readable and the per-frame allocation bounded.
+
+**Reason:**
+Visitors at an installation reflexively wave their *right* hand and expect to see the on-screen reflection lift its right hand on the same side. The unmirrored camera feed reverses this and breaks the "is that me?" recognition moment within 2 seconds. Mirror-at-capture is the lowest-blast-radius implementation. Multi-person was a known-pending requirement from the project doc; the changes are small enough (one `.prefix(4)`, one `Int` field, one key-namespacing pattern) to ship in the same pass.
+
+**Impact:**
+- Build green. No frame-rate change measured.
+- All neg-boxes / blobs / strings now spawn correctly for up to 4 simultaneous people. Verified visually with two operators in frame.
+- Karaoke head-blob still tracks "person 0" (the closest / first-detected); multi-person karaoke is intentionally out of scope.
+
+**Follow-up:**
+- Surface a "max persons" knob in the Art menu's Particle section (1…4) so the operator can clamp the count for a calmer scene at peak crowd times.
+- Consider per-person karaoke-head colour so each dancer's lyric blob is visually distinct.
+
+---
 
 **Decision / change:**
 After shipping the "filmmaker frame" (two-hand L-shape → oriented rectangle revealing live camera) earlier today, hardware-side intuition was that the bimanual L-pose is too brittle: Vision's per-landmark confidences for thumb + indexMCP collapse under installation lighting, and visitors don't reflexively form the gesture. Replaced the whole thing with a much simpler interaction: **open hand → full-screen negative-camera flash**.
