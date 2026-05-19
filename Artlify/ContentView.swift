@@ -120,6 +120,25 @@ struct ContentView: View {
     @State private var asciiDepthBrightness: Double = 0.85
     @State private var asciiDepthDensity: Double = 0.45
     @State private var asciiDepthCollapse: Double = 0.75
+    /// Master gain on the counter-depth audio reactivity. 0
+    /// disables audio-driven modulation entirely; 1 lets the bass
+    /// pump the tunnel, transients flash glitches, and treble
+    /// sweep the hue. Default 0.6 reads as "clearly grooving"
+    /// without overwhelming the static depth field.
+    @State private var asciiDepthReactivity: Double = 0.6
+
+    /// Scene-aware ASCII depth pass. Builds a monocular-depth proxy
+    /// from (person mask + edges + vertical falloff + luma) and
+    /// renders the scene as typographic density layers. See
+    /// `DepthAsciiScene` for the analyzer + renderer.
+    @State private var depthAscii = DepthAsciiScene()
+    @State private var depthAsciiEnabled: Bool = false
+    @State private var depthAsciiIntensity: Double = 0.85
+    @State private var depthAsciiDensity: Double = 0.92
+    @State private var depthAsciiNearHue: Double = 0.08   // warm amber
+    @State private var depthAsciiFarHue: Double = 0.58    // cool indigo
+    @State private var depthAsciiContourBoost: Double = 1.3
+    @State private var depthAsciiWordRate: Double = 0.25
 
     /// Pop-over presentation flags for the two production-ready
     /// menus exposed from the top bar. Replaces the three loose
@@ -127,6 +146,11 @@ struct ContentView: View {
     /// at small window sizes with one bar + two on-demand menus.
     @State private var showArtMenu: Bool = false
     @State private var showMusicMenu: Bool = false
+
+    /// User-managed playlist that drives auto-advance between
+    /// tracks. Every load action (Search sheet, Open File, Sample)
+    /// appends here and starts the queue if nothing else is playing.
+    @State private var queue = MusicQueue()
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -154,9 +178,31 @@ struct ContentView: View {
                     saturation: asciiDepthSaturation,
                     brightness: asciiDepthBrightness,
                     density: asciiDepthDensity,
-                    collapse: asciiDepthCollapse
+                    collapse: asciiDepthCollapse,
+                    audioLevel: Double(audio.latest.level),
+                    audioLow: Double(audio.latest.low),
+                    audioMid: Double(audio.latest.mid),
+                    audioHigh: Double(audio.latest.high),
+                    audioTransient: Double(audio.latest.transient),
+                    reactivity: asciiDepthReactivity
                 )
                 .ignoresSafeArea()
+            }
+
+            // Scene-aware ASCII depth pass — camera-driven, sits
+            // above the procedural counter-depth bg so its typographic
+            // structure reads against the field, but below interactive
+            // overlays so blobs/karaoke/HUD remain crisp on top.
+            if depthAsciiEnabled {
+                DepthAsciiSceneOverlay(
+                    scene: depthAscii,
+                    intensity: depthAsciiIntensity,
+                    density: depthAsciiDensity,
+                    nearHue: depthAsciiNearHue,
+                    farHue: depthAsciiFarHue,
+                    wordRate: depthAsciiWordRate,
+                    contourBoost: depthAsciiContourBoost
+                )
             }
 
             if blobsEnabled {
@@ -214,6 +260,7 @@ struct ContentView: View {
         .onAppear {
             session.start()
             vision.start(consuming: session)
+            depthAscii.start(session: session, vision: vision)
 
             // Wire the file player's tap into the reactor's analysis
             // pipeline. Always-on hook — the reactor's `ingest` no-ops
@@ -223,10 +270,18 @@ struct ContentView: View {
                 audio.ingest(buffer: buffer)
             }
             audioFile.onFinished = {
-                // Karaoke caught up to end-of-track; flip transport
-                // state so the HUD reads paused instead of "playing"
-                // forever after the last frame drains.
-                karaokePlaying = false
+                // Karaoke caught up to end-of-track. Try to advance
+                // the queue to the next item; if the queue is empty
+                // (or this track wasn't queue-driven), flip transport
+                // state so the HUD reads paused.
+                if !playNextInQueue() {
+                    karaokePlaying = false
+                }
+            }
+            musicKit.onFinished = {
+                if !playNextInQueue() {
+                    karaokePlaying = false
+                }
             }
 
             // Build the particle field on the renderer's device and hand
@@ -248,6 +303,7 @@ struct ContentView: View {
             audioFile.stop()
             audio.stop()
             vision.stop()
+            depthAscii.stop()
             session.stop()
         }
         // Push the latest segmentation mask into the renderer whenever
@@ -347,51 +403,7 @@ struct ContentView: View {
         .sheet(isPresented: $showMusicSearch) {
             MusicSearchSheet(
                 onSelect: { result in
-                    switch result.kind {
-                    case .demo, .lrclib:
-                        // Stop any Apple Music playback first so the
-                        // user doesn't hear two sources fighting.
-                        musicKit.stop()
-                        karaoke.track = LRCParser.parse(result.lrc)
-                        karaoke.currentTime = 0
-                        currentTrackTitle = result.title
-                        karaokeEnabled = true
-                        karaokePlaying = true
-                        karaokeLastTick = CFAbsoluteTimeGetCurrent()
-                    case .appleMusic(let song):
-                        // Switch ownership: stop local file player so
-                        // we don't get two audio sources mixing.
-                        audioFile.stop()
-                        // Make sure the mic is running — analysis path
-                        // for ApplicationMusicPlayer is "listen to the
-                        // speakers" since the daemon doesn't expose
-                        // buffers to our process.
-                        if audio.source != .microphone {
-                            audio.switchSource(.microphone)
-                        }
-                        if !audio.isRunning { audio.start() }
-                        currentTrackTitle = result.title
-                        karaokeEnabled = true
-                        karaokePlaying = true
-                        karaokeLastTick = CFAbsoluteTimeGetCurrent()
-                        // Optimistically clear any previous lyrics so
-                        // the overlay shows a clean state until the
-                        // LRCLIB fetch lands.
-                        karaoke.clear()
-                        Task { @MainActor in
-                            await musicKit.play(song: song)
-                            // Try to fetch synced lyrics by title + artist.
-                            // Best-effort — if LRCLIB has nothing, the
-                            // song still plays, just without lyrics.
-                            let hits = (try? await LRCLibClient.search(
-                                track: result.title,
-                                artist: result.artist
-                            )) ?? []
-                            if let synced = hits.first(where: { $0.syncedLyrics?.isEmpty == false })?.syncedLyrics {
-                                karaoke.track = LRCParser.parse(synced)
-                            }
-                        }
-                    }
+                    enqueueSearchResult(result)
                 },
                 onClose: { showMusicSearch = false }
             )
@@ -522,7 +534,7 @@ struct ContentView: View {
             .controlSize(.small)
             .popover(isPresented: $showArtMenu, arrowEdge: .top) {
                 artMenuContent(field: field)
-                    .frame(width: 460, height: 580)
+                    .frame(width: 560, height: 660)
             }
 
             Button {
@@ -534,7 +546,7 @@ struct ContentView: View {
             .controlSize(.small)
             .popover(isPresented: $showMusicMenu, arrowEdge: .top) {
                 musicMenuContent
-                    .frame(width: 520, height: 380)
+                    .frame(width: 600, height: 620)
             }
 
             Toggle(isOn: $showVisionOverlay) {
@@ -620,6 +632,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     backgroundSection
                     asciiDepthSection
+                    depthAsciiSection
                     if let field { particleSection(field: field) }
                     trailsSection
                     silhouetteAsciiSection
@@ -718,6 +731,65 @@ struct ContentView: View {
                                 range: 0...1, fmt: "%.2f")
                     flashSlider(label: "collapse",
                                 value: $asciiDepthCollapse,
+                                range: 0...1, fmt: "%.2f")
+                }
+                HStack(spacing: 14) {
+                    flashSlider(label: "audio",
+                                value: $asciiDepthReactivity,
+                                range: 0...1, fmt: "%.2f")
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var depthAsciiSection: some View {
+        sectionCard(title: "ASCII SCENE DEPTH", icon: "square.stack.3d.up.fill") {
+            HStack {
+                Toggle("enabled", isOn: $depthAsciiEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                Spacer()
+                Text("heuristic depth · person+edges+falloff")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            if depthAsciiEnabled {
+                HStack(spacing: 14) {
+                    flashSlider(label: "intensity",
+                                value: $depthAsciiIntensity,
+                                range: 0...1, fmt: "%.2f")
+                    flashSlider(label: "density",
+                                value: $depthAsciiDensity,
+                                range: 0...1, fmt: "%.2f")
+                }
+                HStack(spacing: 14) {
+                    flashSlider(label: "near hue",
+                                value: $depthAsciiNearHue,
+                                range: 0...1, fmt: "%.2f")
+                    flashSlider(label: "far hue",
+                                value: $depthAsciiFarHue,
+                                range: 0...1, fmt: "%.2f")
+                    Circle()
+                        .fill(LinearGradient(
+                            colors: [
+                                Color(hue: depthAsciiNearHue,
+                                      saturation: 0.55, brightness: 1.0),
+                                Color(hue: depthAsciiFarHue,
+                                      saturation: 0.45, brightness: 0.80)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing))
+                        .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+                        .frame(width: 18, height: 18)
+                }
+                HStack(spacing: 14) {
+                    flashSlider(label: "contour",
+                                value: $depthAsciiContourBoost,
+                                range: 0...3, fmt: "%.2f")
+                    flashSlider(label: "fog text",
+                                value: $depthAsciiWordRate,
                                 range: 0...1, fmt: "%.2f")
                 }
             }
@@ -1012,11 +1084,12 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     Button {
-                        karaoke.loadSample()
-                        currentTrackTitle = karaoke.track?.title ?? "Sample"
-                        karaokeEnabled = true
-                        karaokePlaying = true
-                        karaokeLastTick = CFAbsoluteTimeGetCurrent()
+                        let item = MusicQueueItem(
+                            title: "Sample",
+                            artist: nil,
+                            duration: nil,
+                            source: .sampleLRC)
+                        enqueueAndStartIfIdle(item)
                     } label: {
                         Label("Sample", systemImage: "music.note")
                     }
@@ -1087,6 +1160,12 @@ struct ContentView: View {
 
                 Divider().opacity(0.3)
 
+                // Up Next — user-managed playlist. Auto-advances
+                // when the current track ends; tap a row to jump.
+                queueSection
+
+                Divider().opacity(0.3)
+
                 // Karaoke overlay toggles.
                 HStack(spacing: 8) {
                     Toggle("karaoke", isOn: $karaokeEnabled)
@@ -1124,24 +1203,255 @@ struct ContentView: View {
 
     /// Open-panel + load-file flow extracted from the old karaoke
     /// row so the music menu's "Open File" button can call the same
-    /// path without duplicating the error-surfacing logic.
+    /// path without duplicating the error-surfacing logic. Now feeds
+    /// the file into the shared queue so it slots into auto-advance
+    /// with everything else the user has loaded.
     private func loadAudioFile() {
         guard let url = AudioFilePlayer.runOpenPanel() else { return }
-        do {
+        let title = url.deletingPathExtension().lastPathComponent
+        let item = MusicQueueItem(
+            title: title,
+            artist: nil,
+            duration: nil,
+            source: .localFile(url))
+        enqueueAndStartIfIdle(item)
+    }
+
+    // MARK: - Music queue dispatch
+
+    /// Append to the queue and — if nothing is currently playing —
+    /// immediately advance so the user hears it without an extra
+    /// click. Mirrors the Spotify/Apple Music "queue up" UX.
+    private func enqueueAndStartIfIdle(_ item: MusicQueueItem) {
+        queue.append(item)
+        if !isAnyPlayerActive() {
+            _ = playNextInQueue()
+        }
+    }
+
+    /// Build a queue item from a search-sheet result and route it
+    /// into the shared enqueue-then-start flow. Keeps the .sheet
+    /// onSelect callback short and consistent with the Open File /
+    /// Sample buttons.
+    private func enqueueSearchResult(_ result: MusicSearchResult) {
+        let item: MusicQueueItem
+        switch result.kind {
+        case .appleMusic(let song):
+            item = MusicQueueItem(
+                title: result.title,
+                artist: result.artist,
+                duration: nil,
+                source: .appleMusic(song))
+        case .lrclib, .demo:
+            // Pure-lyrics results have no audio source attached, so
+            // they route through the sample-LRC path. We stash the
+            // LRC text on the karaoke store right before play so the
+            // overlay shows the correct lines.
+            item = MusicQueueItem(
+                title: result.title,
+                artist: result.artist,
+                duration: nil,
+                source: .sampleLRC)
+            // Save the parsed track on the karaoke store immediately
+            // so play(item:) below can reuse it. (sampleLRC path will
+            // overwrite it with the demo track otherwise.)
+            karaoke.track = LRCParser.parse(result.lrc)
+            currentTrackTitle = result.title
+        }
+        enqueueAndStartIfIdle(item)
+    }
+
+    /// True iff a player owns the timeline right now.
+    private func isAnyPlayerActive() -> Bool {
+        if musicKit.isActive { return true }
+        if audioFile.isPlaying { return true }
+        return false
+    }
+
+    /// Pop the next queued item and route it to the right player.
+    /// Returns true if something started, false at end-of-queue so
+    /// callers can mark the transport idle.
+    @discardableResult
+    private func playNextInQueue() -> Bool {
+        guard let next = queue.advance() else { return false }
+        play(item: next)
+        return true
+    }
+
+    /// Central per-item dispatcher. Stops whichever player isn't
+    /// going to own this track, then kicks the one that is. Mirrors
+    /// the source-switching logic the Search sheet used to do inline.
+    private func play(item: MusicQueueItem) {
+        currentTrackTitle = item.artist.map { "\(item.title) — \($0)" } ?? item.title
+        karaokeLastTick = CFAbsoluteTimeGetCurrent()
+        switch item.source {
+        case .localFile(let url):
             musicKit.stop()
-            try audioFile.load(url: url)
-            audio.switchSource(.audioFile)
+            do {
+                try audioFile.load(url: url)
+                audio.switchSource(.audioFile)
+                if !audio.isRunning { audio.start() }
+                karaokeEnabled = true
+                karaokePlaying = true
+                audioFile.play()
+                if karaoke.track == nil { karaoke.loadSample() }
+            } catch {
+                currentTrackTitle = "⚠︎ \(error.localizedDescription)"
+            }
+
+        case .appleMusic(let song):
+            audioFile.stop()
+            if audio.source != .microphone { audio.switchSource(.microphone) }
             if !audio.isRunning { audio.start() }
             karaokeEnabled = true
             karaokePlaying = true
-            audioFile.play()
-            if karaoke.track == nil {
-                karaoke.loadSample()
+            karaoke.clear()
+            Task { @MainActor in
+                await musicKit.play(song: song)
+                let hits = (try? await LRCLibClient.search(
+                    track: item.title,
+                    artist: item.artist ?? "")) ?? []
+                if let synced = hits.first(where: { $0.syncedLyrics?.isEmpty == false })?.syncedLyrics {
+                    karaoke.track = LRCParser.parse(synced)
+                }
             }
-            currentTrackTitle = audioFile.fileName
-            karaokeLastTick = CFAbsoluteTimeGetCurrent()
-        } catch {
-            currentTrackTitle = "⚠︎ \(error.localizedDescription)"
+
+        case .sampleLRC:
+            musicKit.stop()
+            audioFile.stop()
+            // If `enqueueSearchResult` already pre-loaded an LRC for
+            // this row, keep it; otherwise fall back to the bundled
+            // demo so the karaoke overlay still has something to
+            // animate.
+            if karaoke.track == nil { karaoke.loadSample() }
+            karaoke.currentTime = 0
+            karaokeEnabled = true
+            karaokePlaying = true
+        }
+    }
+
+    // MARK: - Queue section UI
+
+    /// Scrollable "Up Next" list rendered inside the music menu.
+    /// Each row shows source icon + title + duration; the current
+    /// row is highlighted. Per-row controls: up / down / remove.
+    /// Whole-row tap jumps the cursor and plays that item now.
+    @ViewBuilder
+    private var queueSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "text.append")
+                    .foregroundStyle(.secondary)
+                Text("UP NEXT")
+                    .font(.system(.caption, design: .monospaced).weight(.semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(.secondary)
+                if !queue.items.isEmpty {
+                    Text("· \(queue.items.count)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                if !queue.items.isEmpty {
+                    Button(role: .destructive) {
+                        queue.clear()
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                }
+            }
+
+            if queue.items.isEmpty {
+                Text("Queue is empty. Add tracks from Search, Open File, or Sample.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ScrollView {
+                    VStack(spacing: 4) {
+                        ForEach(Array(queue.items.enumerated()), id: \.element.id) { idx, item in
+                            queueRow(index: idx, item: item)
+                        }
+                    }
+                }
+                .frame(maxHeight: 160)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func queueRow(index: Int, item: MusicQueueItem) -> some View {
+        let isCurrent = (queue.currentIndex == index)
+        HStack(spacing: 8) {
+            Image(systemName: isCurrent
+                  ? (karaokePlaying ? "speaker.wave.2.fill" : "speaker.fill")
+                  : item.sourceIcon)
+                .foregroundStyle(isCurrent ? Color.green : Color.secondary)
+                .frame(width: 14)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.title)
+                    .font(.callout.weight(isCurrent ? .semibold : .regular))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let a = item.artist, !a.isEmpty {
+                    Text(a)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 6)
+            if let d = item.duration, d > 0 {
+                Text(timecode(d))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
+            // Reorder + remove controls. Compact so a row fits in
+            // ~26pt without truncating the title.
+            Button {
+                queue.moveUp(index)
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.mini)
+            .disabled(index == 0)
+
+            Button {
+                queue.moveDown(index)
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.mini)
+            .disabled(index == queue.items.count - 1)
+
+            Button {
+                queue.remove(at: index)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.mini)
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isCurrent
+                      ? Color.green.opacity(0.12)
+                      : Color.white.opacity(0.04))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if let it = queue.jump(to: index) {
+                play(item: it)
+            }
         }
     }
 
@@ -1490,6 +1800,13 @@ struct ContentView: View {
                                 range: 0...1,
                                 fmt: "%.2f")
                 }
+                HStack(spacing: 14) {
+                    flashSlider(label: "audio",
+                                value: $asciiDepthReactivity,
+                                range: 0...1,
+                                fmt: "%.2f")
+                    Spacer()
+                }
             }
         }
         .padding(10)
@@ -1520,8 +1837,8 @@ struct ContentView: View {
             }
             Slider(value: value, in: range)
                 .controlSize(.mini)
-                .frame(width: 110)
         }
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
@@ -1730,8 +2047,8 @@ struct ContentView: View {
             Text("\(label): " + String(format: fmt, value.wrappedValue))
                 .font(.caption.monospaced())
             Slider(value: value, in: range)
-                .frame(width: 140)
         }
+        .frame(maxWidth: .infinity)
     }
 
     private func toggleFullscreen() {

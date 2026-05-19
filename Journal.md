@@ -15,6 +15,168 @@ Entry template:
 
 ---
 
+## 2026-05-19 — ASCII depth pass: Metal renderer + audio-reactive counter-depth (Phase H)
+
+**Decision / change:**
+Two coupled fixes to the ASCII layer shipped in Phases C and G.
+
+### H1. Port `DepthAsciiSceneOverlay` from SwiftUI Canvas to Metal
+
+Phase G's renderer used `TimelineView(.animation(minimumInterval: 1/24)) + Canvas + .drawingGroup()` with one `gctx.resolve(Text(…))` per cell per frame. At 96 × 54 = 5184 cells × 24 Hz that's ~125 k text-resolve calls per second; SwiftUI Canvas can't sustain it on integrated GPUs and the whole app stuttered when the toggle was on.
+
+Replaced with an instanced-quad Metal renderer. Same `DepthAsciiSceneOverlay` public API (intensity / density / nearHue / farHue / contourBoost — `wordRate` retained but currently inert, see follow-up). Two new files in [Artlify/AppShell/](Artlify/AppShell/) — Xcode's file-system-synchronized groups auto-include them so no `project.pbxproj` edits:
+
+1. [Artlify/AppShell/DepthAsciiMetal.metal](Artlify/AppShell/DepthAsciiMetal.metal) (~90 lines). Two functions:
+   - `depth_ascii_vs(vid, iid, AsciiUniforms, AsciiCell*)` — one instance per tile, four-vertex triangle strip per instance. Vertex shader computes the cell's screen-space origin from `iid % tilesX, iid / tilesX`, expands the corner from `vid` (0=BL, 1=BR, 2=TL, 3=TR), applies the per-cell `sizeScale` + `swayX`, maps to NDC (`y` flipped for MTKView top-left origin). Also unpacks the per-cell `colorRGBA: uint32` (0xRRGGBBAA) into a `float4` tint and computes the atlas UV rectangle from `glyphIndex` and the atlas-grid uniform.
+   - `depth_ascii_fs(VOut, atlas)` — samples the R8 atlas with linear filtering, outputs premultiplied `float4(tint.rgb · a, tint.a · a)` for standard `.sourceOver` blending.
+   - `struct AsciiCell { uint glyphIndex; uint colorRGBA; float sizeScale; float swayX; }` (16 B, alignment 4).
+   - `struct AsciiUniforms { float2 viewSize; uint2 tilesXY; uint2 atlasGrid; float2 atlasCellPx; }` (32 B, alignment 8).
+
+2. [Artlify/AppShell/DepthAsciiMetalRenderer.swift](Artlify/AppShell/DepthAsciiMetalRenderer.swift) (~420 lines). Three pieces:
+   - **`DepthAsciiAtlas`** — builds a 512 × 448 R8Unorm `MTLTexture` at init by CoreText-rendering one glyph per cell into an 8 × 7 cell grid (64 px each), 56 slots for the 49 unique glyphs across the three ramps (`near` bold Menlo at 0.78× cell size, `mid` / `far` regular Menlo at 0.72× cell size, plus slot 0 = blank for gated cells). Glyphs are pixel-centered using `CTLineGetBoundsWithOptions(.useGlyphPathBounds)`. The atlas is built once, lives for the view's lifetime, and exposes pre-computed `nearIndices`, `midIndices`, `farIndices` (`[UInt32]`) so the per-frame hot path is a direct array subscript instead of a `Dictionary<Character, Int>` probe.
+   - **`DepthAsciiMetalRenderer: NSObject, MTKViewDelegate`** — holds the device / queue / pipeline / atlas / triple-buffered cell `MTLBuffer`s (3 in-flight, DispatchSemaphore = 3) / the live HUD knobs. `draw(in:)` runs the same per-cell band-selection logic the Canvas overlay used (density gate `keepP = density · max(0.15, d·1.05 + 0.10)`, near band > 0.62 with contour-magnitude boost into the densest glyph end, mid band > 0.32 with stable-hash glyph rotation, far band ≤ 0.32 with horizontal sway), writes 5184 `AsciiCellGPU` records into the cycle's buffer, encodes ONE `drawPrimitives(.triangleStrip, vertexCount: 4, instanceCount: 5184)` call. Per-cell CPU work is sub-millisecond on M-series (5 k iterations of arithmetic + one buffer write).
+   - **`DepthAsciiMetalView: NSViewRepresentable`** — wraps `MTKView` (bgra8Unorm, `framebufferOnly = true`, `preferredFramesPerSecond = 30`, transparent clearColor, `isOpaque = false` so the camera shows through gated cells). `updateNSView` pushes the latest knob values into the live renderer instance held by the Coordinator.
+
+[Artlify/AppShell/DepthAsciiScene.swift](Artlify/AppShell/DepthAsciiScene.swift) — `DepthAsciiSceneOverlay.body` shrunk from ~140 lines of Canvas draw logic to a 12-line wrapper around `DepthAsciiMetalView`. Old Canvas draw helpers + `stableHash` deleted from this file (an equivalent `stableHash` lives in the Metal renderer with identical seeds so visual output stays congruent across the migration). `AsciiRamps` lifted from `private enum` to `enum` so the renderer's atlas builder can iterate the same character sequence.
+
+### H2. Audio-reactive counter-depth ASCII background
+
+[Artlify/AppShell/AsciiDepthBackground.swift](Artlify/AppShell/AsciiDepthBackground.swift) gains five `Double` audio-band inputs (`audioLevel` / `audioLow` / `audioMid` / `audioHigh` / `audioTransient`, all 0…1, default 0) plus a `reactivity: Double = 0.6` master gain. Inside the per-frame `draw(...)` closure, the existing parameters are replaced by audio-modulated effective values:
+
+```
+gain         = max(0, reactivity)
+collapseEff  = min(1, collapse  + audioLow       · gain · 0.40)   // bass pumps the tunnel inward
+densityEff   = min(1, density   + audioMid       · gain · 0.20)   // mids thicken the field
+brightEff    = min(1.5, brightness + audioTransient · gain · 0.35
+                                  + audioLevel    · gain · 0.15)  // beats + RMS brighten
+satEff       = min(1, saturation + audioMid       · gain · 0.20)
+hueEff       = (hue + audioHigh · gain · 0.08) mod 1.0            // treble sweeps colour
+glitchThresh = max(0.80, 0.992 - audioTransient · gain · 0.10)    // onsets multiply corrupt-glyph bursts
+scrollGain   = 1.0 + audioLevel · gain · 0.6                       // RMS accelerates outward scroll
+```
+
+`scroll`, `collapseEff`, the glitch-threshold compare, and the per-row brightness multiplier all consume these effective values; at `reactivity = 0` every effective value collapses back to the un-modulated original, so the visual is bit-identical to Phase C when audio reactivity is disabled.
+
+[Artlify/ContentView.swift](Artlify/ContentView.swift):
+- New `@State private var asciiDepthReactivity: Double = 0.6` next to the rest of the counter-depth knobs.
+- The `AsciiDepthBackground(...)` call site passes `Double(audio.latest.level/low/mid/high/transient)` and `reactivity: asciiDepthReactivity` — same band-passing pattern `KaraokeOverlay` and `HeadLyricBlob` already use.
+- A new `flashSlider(label: "audio", value: $asciiDepthReactivity, range: 0...1, fmt: "%.2f")` row added to both the inline `asciiDepthSection` (Art popover) and the duplicated card variant lower in the file (kept in sync for HUD parity).
+
+**Reason:**
+H1 was forced by *"the performance is so bad. dont you think the ASCII scene needs to be rendered with metal?"* — Phase G's renderer is the right *visual* (3-ramp depth-banded glyph grid with contour boost) but the *delivery mechanism* (SwiftUI Canvas resolving one `Text` per cell per frame) was a textbook anti-pattern at this cell count. Metal-instanced glyph atlases are the canonical fix for typographic grids of any non-trivial size; the per-cell CPU work was already cheap, only the rendering needed to change.
+
+H2 was the second half of the same instruction: *"i also task you to make the counter depth ascii to be audio reactive."* The counter-depth pass shipped in Phase C predates the systematic audio-band routing the rest of the app uses (Karaoke, head blob, particles all already sample `audio.latest.{level,low,mid,high,transient}`). Wiring it the same way + adding a single master `reactivity` gain keeps the HUD surface area small while making the layer feel coupled to the track — bass literally pulls the tunnel inward, beats flash glitches, treble sweeps the colour wheel.
+
+**Impact:**
+- Build green (`xcodebuild ... -destination 'platform=macOS' build` → **BUILD SUCCEEDED**, no errors or warnings in any of the new files after the `fileprivate var renderer` adjustment).
+- Draw-call count for the scene-aware ASCII pass dropped from `~5184 per frame` (one SwiftUI text per cell) to `1 per frame` (instanced strip).
+- Per-frame text-shaping work eliminated; CPU side is now just 5 k iterations of integer + float arithmetic + one shared-memory buffer write.
+- `DepthAsciiSceneOverlay` public API is unchanged — ContentView call site untouched. The `wordRate` parameter is currently inert in the Metal path (single-glyph atlas only) but kept on the type for compile-time API parity; the follow-up is to add a second draw pass with a variable-width word atlas.
+- Counter-depth audio reactivity is opt-out: `reactivity` defaults to 0.6 (clearly grooving but not overwhelming); set it to 0 in the HUD to get the exact Phase-C behaviour.
+
+**Follow-up:**
+- Re-add the mid/far "word fragment" layer in the Metal renderer via a second draw pass with a variable-width word atlas (or sprite-sheet of pre-rendered words). Trivial — same instanced-quad path, just a wider atlas and a separate `WordCell` buffer populated for the cells that previously triggered `if d < 0.62 && wordRate > 0`.
+- Optional: feed audio bands into `DepthAsciiSceneOverlay` too (transient → contour boost, low → near-band density), so both ASCII layers pulse together on beats.
+- Confirm in Instruments that the new Metal pass costs <1 ms of GPU time per frame on M2 hardware (expected — 5184 textured quads with simple blending is well inside the budget). 30-minute thermal soak with both ASCII layers + particles + karaoke still pending from Phase G.
+- Audit the duplicated `asciiDepthSection` HUD card lower in `ContentView.swift` (~line 1750) — looks like dead code left over from the Phase D popover refactor; if so, delete in the next pass.
+
+---
+
+## 2026-05-19 — Scene-aware ASCII depth pass (Phase G — experiment)
+
+**Decision / change:**
+New artistic experiment that actually looks at the camera: a typographic depth layer that builds a monocular-depth proxy from the scene, then renders the spatial hierarchy as character density.
+
+New file [Artlify/AppShell/DepthAsciiScene.swift](Artlify/AppShell/DepthAsciiScene.swift) (~330 lines), two pieces:
+
+1. **`DepthAsciiScene` analyzer** (`@Observable @MainActor`). 96 × 54 tile grid (16:9, ~5.2k cells). Background `Task` at 12 Hz that:
+   - Pulls the latest `CVPixelBuffer` from `CameraSession`.
+   - Runs `CIImage(cvPixelBuffer:)` → two passes through a single shared `CIContext(options: [.cacheIntermediates: false])`: one for luma (RGBA8 render → 0.299 R + 0.587 G + 0.114 B), one for contour magnitude via `CIEdges` with `inputIntensity = 6`.
+   - Reads `VisionSession.latestFrame?.personMask` (raw `OneComponent8` CVPixelBuffer) and nearest-neighbour samples it into the same tile grid.
+   - Blends the three signals into a per-tile depth proxy in `[0,1]`, with **1.0 = nearest**:
+     ```
+     d = max(
+       personMask,                              // body wins outright
+       0.55·verticalPos + 0.25·edges,           // ground + contour density
+       0.35·(1 − luma)  + 0.20·verticalPos      // dark + ground bias
+     )
+     ```
+   - Light EMA smoothing (α = 0.55 toward the new sample) so the dancer's motion stays live but the static background doesn't shimmer.
+   - Publishes `depthGrid`, `edgeGrid`, `lumaGrid` as `[Float]` arrays — SwiftUI sees a single array swap per analyzer tick.
+
+2. **`DepthAsciiSceneOverlay` renderer** (`TimelineView(.animation(minimumInterval: 1/24)) + Canvas + .drawingGroup()`). Three glyph ramps:
+   - **Near** (`d > 0.62`) — structural: `█▓▒#@&%MW8B$NQH0R`. Contour magnitude boosts the chosen glyph toward the densest end and pushes it to `.bold`, so silhouette edges crystallize.
+   - **Mid** (`0.32 < d ≤ 0.62`) — typographic: `+=<>?/\|*()[]{}!:;~^`. Tick-derived stable hash picks the glyph so the layer mutates at sub-Hertz cadence instead of every frame.
+   - **Far** (`d ≤ 0.32`) — sparse fog: `.·•¨"' `,°˙ ` `. Cells gently sway horizontally (`sin(t·0.7 + x·0.13 + y·0.09) · cellW · 0.18`) so the layer feels alive even when the scene is static.
+   - **Text-like atmospheric noise**: in mid/far bands, a small chance (`wordRate · (1 − d) · 0.05`) of swapping the single glyph for a short word fragment from `["fog","void","echo","drift","noise","hum","blur","haze","veil","static","sigh","ash",…]`. Reads as half-perceived language in the distance.
+   - Density gating: `keepP = density · max(0.15, d·1.05 + 0.10)` — far cells thin out faster than near cells, so the dancer is structurally solid while the background dissolves into sparse symbols (the explicit goal of this experiment).
+   - Colour: near band warm-amber (`hue ≈ 0.08`), far band cool-indigo (`hue ≈ 0.58`), mid lerps between them. Per-band opacity ramps with depth.
+   - Stable per-cell `stableHash(x,y,tick)` (FNV-1a-flavoured) drives all the random choices so the layer animates without re-seeding noise every frame.
+
+HUD section added in [Artlify/ContentView.swift](Artlify/ContentView.swift) under the Art popover as `depthAsciiSection` ("ASCII SCENE DEPTH"): enable toggle, intensity, density, near hue, far hue, contour boost, fog-text rate, with a two-stop hue-gradient swatch showing the near→far palette. ZStack placement: above the procedural `AsciiDepthBackground` (so the typographic structure reads against the field) and below the foreground overlays (blobs, karaoke, pose, HUD) so they remain crisp on top.
+
+Lifecycle: `depthAscii.start(session: session, vision: vision)` in `.onAppear`, `depthAscii.stop()` in `.onDisappear`. The analyzer task runs whether the overlay is visible or not — the cost is bounded (~12 Hz with two CIImage renders + a mask downsample on 96×54 = trivial), and keeping the grid warm means flipping the toggle feels instant.
+
+**Reason:**
+The user asked for monocular depth estimation, contour detection, and a cinematic depth rendering done as ASCII / typographic density / digital grain — with near objects sharply defined and distant areas dissolving into symbolic fog and text-like atmospheric noise.
+
+True monocular depth needs a learned model (DepthAnything, DepthPro). Bundling that is heavy and outside the scope of this experiment, so this pass builds a depth *proxy* from the signals we already have on tap: Vision's person segmentation mask (body = always near), `CIEdges` magnitude (high local detail = usually nearer, low detail = usually farther — same intuition as defocus-based monocular depth), and a vertical-position prior (top of the frame is typically further away than the bottom for a person-in-room scene). It reads convincingly as depth on the kinds of scenes Artlify is going to live in (a performer in a room with a wall behind them), and the renderer is *agnostic to the source* of `depthGrid` — when we drop a real CoreML depth model in here later, we just write into the same `[Float]` array and nothing in the overlay changes.
+
+The three-ramp split (structural / typographic / atmospheric) is the explicit answer to "near objects sharper and structurally defined, distant areas dissolve into sparse symbolic fog". The fog-text-word layer is the explicit answer to "text-like atmospheric noise". The contour boost is the explicit answer to "structurally defined" — `CIEdges` magnitude controls which glyph in the near band gets chosen, so the dancer's silhouette is drawn with `█▓#@&` and a flat wall behind them with `R0H` even though both are inside the "near" band.
+
+**Impact:**
+- Build green (`xcodebuild ... BUILD SUCCEEDED`, no errors or warnings in the new file).
+- Layer stack inside the ContentView ZStack is now, back → front: `CameraMetalView` → `bgColor` scrim → `AsciiDepthBackground` (procedural) → `DepthAsciiSceneOverlay` (scene-aware) → `BlobBoxesOverlay` → `KaraokeOverlay` → `HeadLyricBlob` → `PoseOverlay` → top bar HUD.
+- Analyzer is independent of `VisionProcessor` — no changes to the Vision pipeline, no risk of regressing pose / hand / segmentation cadence. It just *reads* the published mask.
+- 7 new `@State` knobs in `ContentView` mirror the renderer's free parameters; the new HUD section follows the same `sectionCard` chrome as everything else in the Art popover.
+
+**Follow-up:**
+- Swap the heuristic depth proxy for a learned monocular-depth CoreML model (DepthAnything v2 small or DepthPro). Same `depthGrid` write contract — renderer is untouched. Bundle the model under `~/Library/Application Support/Artlify/Models/depth/` to keep the app binary lean (per `ProjectDocument.md` §13).
+- Audio reactivity: modulate `wordRate` and `contourBoost` with the audio reactor's transient channel so the typographic fog pulses on beats.
+- Per-band glyph kerning + line scrolling so the mid band reads more like a horizontal text stream and less like a glyph grid.
+- 30-minute thermal soak with both the procedural `AsciiDepthBackground` and `DepthAsciiSceneOverlay` enabled simultaneously, plus particles and karaoke — confirm Canvas + CIContext per-frame cost stays inside the M5 budget.
+- Optional `MTLClearColor` / Metal renderer path if Canvas turns out to be the bottleneck at higher tile resolutions.
+
+---
+
+## 2026-05-19 — Art popover sizing fix + Music queue with auto-advance (Phase F)
+
+**Decision / change:**
+Two changes — one chrome fix, one new feature.
+
+1. **Art popover no longer crops its content.** Root cause: the popover was pinned at `460×580`, but the two slider helpers (`slider` for the particle field's `Float`-typed knobs and `flashSlider` for the `Double`-typed knobs) declared `.frame(width: 140)` / `.frame(width: 110)` on their inner `Slider`, so a two-slider `HStack` inside a `sectionCard` always overshot the 460 pt content width and the right knob got clipped. Fix: bump the Art popover to `560×660` and relax both slider helpers to `.frame(maxWidth: .infinity)` so they distribute the available row width inside whatever container they land in. Music popover bumped to `600×620` to make room for the new queue list.
+2. **MusicQueue + auto-advance.** New file [Artlify/AppShell/MusicQueue.swift](Artlify/AppShell/MusicQueue.swift) (~180 lines):
+   - `MusicQueueItem` — `id: UUID`, `title`, `artist?`, `duration?`, `source: Source` with cases `.localFile(URL)` / `.appleMusic(Song)` / `.sampleLRC`. Stable `UUID` so SwiftUI's `ForEach` reorder is rock-solid across `move(from:to:)`.
+   - `@Observable @MainActor final class MusicQueue` — `items`, `currentIndex`, mutation APIs (`append`, `playNext`, `remove`, `clear`, `move(from:to:)`, `moveUp`/`moveDown`) and cursor APIs (`advance() -> MusicQueueItem?`, `previous()`, `jump(to:)`). Every mutation keeps `currentIndex` pointing at the *same logical track* across reorders.
+   - Auto-advance wiring lives in `ContentView`:
+     - Added `public var onFinished: (() -> Void)?` on `MusicKitPlayer`; fired inside the existing 100 ms poll loop's end-of-track branch (`status == .stopped && currentTime >= duration - 0.1`). Cancels the poll task before firing so the same drain doesn't double-fire.
+     - `audioFile.onFinished` and `musicKit.onFinished` both now call `playNextInQueue()`; only if that returns false (end-of-queue) do they flip `karaokePlaying = false`.
+   - `ContentView` queue helpers: `enqueueAndStartIfIdle(_:)`, `enqueueSearchResult(_:)`, `playNextInQueue() -> Bool`, `play(item:)` (central source-dispatcher), `isAnyPlayerActive()`.
+   - Source-dispatch in `play(item:)` mirrors the old inline logic from the `.sheet onSelect` and the original `loadAudioFile()`: stops whichever player isn't going to own this track, switches `AudioReactor` source if needed, kicks the new player. Apple Music branch still does the best-effort LRCLIB lookup so synced lyrics arrive a beat after audio starts.
+   - HUD changes in `musicMenuContent`:
+     - **Open File**, **Sample**, and **Search-result** now all funnel through `enqueueAndStartIfIdle(_:)` instead of triggering playback directly. UX: every action you take queues the track; if nothing's playing, it starts immediately. Matches Spotify / Apple Music muscle memory.
+     - New **Up Next** section (`queueSection` / `queueRow(index:item:)`) — `ScrollView`-wrapped list capped at 160 pt tall. Each row: source-kind icon (switches to a green `speaker.wave.2.fill` when playing), title + artist, duration timecode, up / down / remove buttons. Whole-row tap calls `queue.jump(to: idx)` and routes the result to `play(item:)`. **Clear** button in the section header empties the queue (and current cursor).
+
+**Reason:**
+The popover crop was visible the moment two knobs sat side-by-side — the layout was pre-determined by the helper rather than the container, which is the opposite of how SwiftUI is supposed to compose. Flexing the slider widths makes the helpers re-usable in popovers of any size and removes the "menu felt cramped" feedback.
+
+The queue closes a glaring gap: the operator had to manually re-search and re-tap every time a song ended, which is impossible during a live performance. Centralising the dispatch via `play(item:)` also collapses two near-duplicate code paths (the inline `.sheet onSelect` switch and the original `loadAudioFile()`) into one — every play, whether triggered by Search, Open File, Sample, queue-row-tap, or auto-advance, takes the exact same route through `play(item:)`, so source-switching bugs can't desync any more.
+
+**Impact:**
+- Build green (`xcodebuild ... BUILD SUCCEEDED`).
+- Art popover: every section card now fits with breathing room; two-slider rows no longer clip on the right.
+- Music popover: persistent queue visible at all times; transport keeps working unchanged for the one-off case (empty queue).
+- `MusicKitPlayer` gains a one-line public contract (`onFinished`); no other call-sites needed an update because the previous behaviour (just flipping internal `isPlaying = false`) is preserved when no handler is set.
+
+**Follow-up:**
+- Persist `MusicQueue.items` across launches (likely via JSON in `Application Support/Artlify/queue.json`).
+- "Shuffle queue" + "repeat queue" toggles.
+- Drag-to-reorder via `.onDrag` / `.onDrop` instead of chevron buttons (chevrons stay as the accessible fallback).
+- LRCLIB pre-fetch when an Apple Music row is *enqueued*, not when it starts playing, so lyrics are ready the instant auto-advance kicks in.
+- Delete the still-dead `karaokeRow_unused` / `backgroundPanel` / `statusHUD` / `particlePanel(field:)` helpers in the next cleanup pass.
+
+---
+
 ## 2026-05-19 — Production-ready HUD: top bar + Art / Music popovers (Phase D)
 
 **Decision / change:**

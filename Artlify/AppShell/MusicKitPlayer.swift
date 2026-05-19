@@ -46,6 +46,11 @@ public final class MusicKitPlayer {
     public private(set) var isActive: Bool = false
     public private(set) var lastError: String?
 
+    /// Called on the main actor when the catalog song plays to its
+    /// end. Wired up in `ContentView` so the queue auto-advances to
+    /// the next track without user input.
+    public var onFinished: (() -> Void)?
+
     // MARK: - Private
 
     private let player = ApplicationMusicPlayer.shared
@@ -151,6 +156,15 @@ public final class MusicKitPlayer {
                    self.currentTime >= self.duration - 0.1 {
                     self.currentTime = self.duration
                     self.isPlaying = false
+                    // One-shot end-of-track notification so the
+                    // queue can auto-advance. Cancel the poll right
+                    // after — a fresh `play(song:)` will start a
+                    // new one. Guard with the cancel so the same
+                    // drain doesn't double-fire on the next tick.
+                    self.pollTask?.cancel()
+                    self.pollTask = nil
+                    self.onFinished?()
+                    return
                 }
                 try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
             }

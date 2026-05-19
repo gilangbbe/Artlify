@@ -41,6 +41,29 @@ struct AsciiDepthBackground: View {
     /// every frame.
     var collapse: Double = 0.75
 
+    // MARK: Audio reactivity
+    //
+    // Per-band 0…1 amplitudes piped in from `AudioReactor.latest`
+    // (same shape KaraokeOverlay / HeadLyricBlob receive). The
+    // master `reactivity` gain scales every modulation; at 0 the
+    // view is identical to the pre-audio implementation.
+
+    /// Broadband RMS-ish amplitude.
+    var audioLevel: Double = 0
+    /// Low-band energy. Pulls the tunnel inward (bass pumps).
+    var audioLow: Double = 0
+    /// Mid-band energy. Lifts saturation.
+    var audioMid: Double = 0
+    /// High-band energy. Sweeps hue toward the cool end of the
+    /// wheel — treble shimmer.
+    var audioHigh: Double = 0
+    /// Per-frame transient (onset / beat). Boosts brightness and
+    /// glitch density on hits.
+    var audioTransient: Double = 0
+    /// Master gain on every audio-driven modulation. 0 disables
+    /// audio reactivity entirely.
+    var reactivity: Double = 0.6
+
     // Sparse → dense glyph ramp. The leading spaces keep the centre
     // of the depth field readable as "hollow" rather than crowded.
     private static let ramp: [Character] = [
@@ -76,9 +99,25 @@ struct AsciiDepthBackground: View {
     private func draw(in ctx: GraphicsContext,
                       size: CGSize,
                       time: TimeInterval) {
+        // Effective per-frame audio-modulated parameters. All five
+        // bands feed in via the master `reactivity` gain so the user
+        // can dial the whole pass between "static texture" and
+        // "fully driven by the track" with a single slider.
+        let gain = max(0, reactivity)
+        let collapseEff  = min(1.0, collapse  + audioLow       * gain * 0.40)
+        let densityEff   = min(1.0, density   + audioMid       * gain * 0.20)
+        let brightEff    = min(1.5, brightness + audioTransient * gain * 0.35
+                                                + audioLevel    * gain * 0.15)
+        let satEff       = min(1.0, saturation + audioMid       * gain * 0.20)
+        let hueEff       = (hue + audioHigh * gain * 0.08).truncatingRemainder(dividingBy: 1.0)
+        // Transient pushes glitch threshold downward → more corrupt
+        // glyphs flash on beat onsets.
+        let glitchThresh = max(0.80, 0.992 - audioTransient * gain * 0.10)
+        let scrollGain   = 1.0 + audioLevel * gain * 0.6
+
         // glyphPt → cell metrics. Monospaced advance is ~0.6× the
         // point size for the system mono; line height ~1.05×.
-        let glyphPt: CGFloat = max(9, 22 - CGFloat(density) * 13)
+        let glyphPt: CGFloat = max(9, 22 - CGFloat(densityEff) * 13)
         let cellW = glyphPt * 0.62
         let cellH = glyphPt * 1.05
         let cols = max(8, Int(size.width / cellW))
@@ -91,13 +130,12 @@ struct AsciiDepthBackground: View {
         let cy = Double(rows) * 0.5
         let maxR = max(0.0001, sqrt(cx * cx + cy * cy))
         let t = time
-        // Outward scroll. Multiplier scales with `collapse` so the
+        // Outward scroll. Multiplier scales with `collapseEff` so the
         // user can fade between "still hollow" and "rushing toward
-        // the camera". The minimum floor keeps even collapse=0
-        // breathing slightly so the grid never reads as a static
-        // wallpaper.
-        let scroll = t * (0.4 + 1.2 * collapse)
-        let baseColor = Color(hue: hue, saturation: saturation, brightness: 1.0)
+        // the camera"; audio level adds a frame-coherent push so the
+        // tunnel literally accelerates on loud passages.
+        let scroll = t * (0.4 + 1.2 * collapseEff) * scrollGain
+        let baseColor = Color(hue: hueEff, saturation: satEff, brightness: 1.0)
         let rampCount = Self.ramp.count
         let corruptCount = Self.corrupt.count
         let tHash = Int(t * 5)   // quantised time slot for the glitch hash
@@ -123,7 +161,7 @@ struct AsciiDepthBackground: View {
                 // Radial sinusoid scrolling outward → glyphs cycle
                 // through density bands like a tunnel rushing past.
                 var d = r
-                d -= sin((r * 6.0 - scroll) * .pi) * 0.22 * collapse
+                d -= sin((r * 6.0 - scroll) * .pi) * 0.22 * collapseEff
                 // Tiny per-cell jitter so adjacent cells never lock
                 // into identical glyphs even when r is identical.
                 d += sin(t * 0.9
@@ -132,8 +170,10 @@ struct AsciiDepthBackground: View {
                 d = max(0, min(0.9999, d))
 
                 // Cheap deterministic per-cell-per-time-slot hash.
+                // Threshold drops with audio transients → glitch
+                // bursts ride the beat.
                 let h = Self.hash01(col, row, tHash)
-                if h > 0.992 {
+                if h > glitchThresh {
                     // Glitch flash: substitute a corrupt glyph.
                     let idx = Int(h * 9973) % corruptCount
                     buf.append(Self.corrupt[idx])
@@ -152,7 +192,7 @@ struct AsciiDepthBackground: View {
             let line = String(buf)
             let text = Text(line)
                 .font(font)
-                .foregroundColor(baseColor.opacity(opa * brightness))
+                .foregroundColor(baseColor.opacity(opa * brightEff))
             ctx.draw(
                 text,
                 at: CGPoint(x: 0, y: CGFloat(row) * cellH),
@@ -172,7 +212,7 @@ struct AsciiDepthBackground: View {
                               width: size.width,
                               height: cellH)
             ctx.fill(Path(rect),
-                     with: .color(.white.opacity(0.06 * brightness)))
+                     with: .color(.white.opacity(0.06 * brightEff)))
         }
     }
 
