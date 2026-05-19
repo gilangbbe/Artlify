@@ -93,6 +93,7 @@ final class TileEngine {
 
     func start() {
         guard !isPlaying else { return }
+        notePlayer.restart()
         isPlaying      = true
         isGameOver     = false
         isSongComplete = false
@@ -234,18 +235,29 @@ final class TileEngine {
         // Pre-compute head centre once per tick (cheaper than per-tile).
         let head = headCenter()
 
-        // Per-lane: find the ID of the bottommost (highest topY) active tile.
-        // Only that tile can be hit; tiles above it are locked until it's cleared.
+        // Per-lane bottommost: tile with the earliest absoluteTargetTime in its
+        // lane is always lowest on screen (all tiles fall at the same speed).
         var bottommostID: [Int: UUID] = [:]
+        var bottommostTime: [Int: Double] = [:]
         for tile in activeTiles where tile.state == .active {
-            let y = tileTopY(tile)
-            if let bid = bottommostID[tile.lane] {
-                let curY = activeTiles.first(where: { $0.id == bid }).map { tileTopY($0) } ?? -1
-                if y > curY { bottommostID[tile.lane] = tile.id }
+            if let t = bottommostTime[tile.lane] {
+                if tile.absoluteTargetTime < t {
+                    bottommostTime[tile.lane] = tile.absoluteTargetTime
+                    bottommostID[tile.lane] = tile.id
+                }
             } else {
+                bottommostTime[tile.lane] = tile.absoluteTargetTime
                 bottommostID[tile.lane] = tile.id
             }
         }
+
+        // Global frontier: find the earliest absoluteTargetTime among all
+        // per-lane bottommost tiles. Only tiles within a small window of
+        // that global front can be hit — the player must always address
+        // the most-urgent tile before touching any tile above it, even
+        // across different lanes.
+        let globalFront = bottommostTime.values.min() ?? .greatestFiniteMagnitude
+        let hitWindow   = song.beatDuration * 0.10   // ~10 % of one beat
 
         for i in activeTiles.indices where activeTiles[i].state == .active {
             let topY   = tileTopY(activeTiles[i])
@@ -263,8 +275,10 @@ final class TileEngine {
                 return   // stop processing remaining tiles this tick
             }
 
-            // Only the bottommost tile in this lane can be hit.
-            guard bottommostID[lane] == activeTiles[i].id else { continue }
+            // Must be (a) bottommost in its lane and (b) at the global front.
+            guard bottommostID[lane] == activeTiles[i].id,
+                  activeTiles[i].absoluteTargetTime <= globalFront + hitWindow
+            else { continue }
 
             let laneMinX = Double(lane) * laneW
             let laneMaxX = laneMinX + laneW

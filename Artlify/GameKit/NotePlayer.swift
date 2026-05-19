@@ -51,6 +51,16 @@ final class NotePlayer {
         isReady = false
     }
 
+    func restart() {
+        guard !engine.isRunning else { return }
+        do {
+            try engine.start()
+            isReady = true
+        } catch {
+            print("NotePlayer: engine restart failed — \(error)")
+        }
+    }
+
     // MARK: - Private
 
     private func setup() {

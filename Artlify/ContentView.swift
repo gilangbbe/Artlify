@@ -216,6 +216,10 @@ struct ContentView: View {
             guard gameModeOn else { return }
             gameEngine?.update(joints: vision.latestFrame?.joints ?? [],
                                jointTimestamp: vision.latestFrame?.timestamp ?? 0)
+            if (gameEngine?.isGameOver == true || gameEngine?.isSongComplete == true),
+               activeAppleMusicHandle != nil {
+                ApplicationMusicPlayer.shared.stop()
+            }
         }
         // Periodically flash 1–3 negative-camera boxes around random
         // body joints. Empty frames (no joints) are silently skipped.
