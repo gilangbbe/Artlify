@@ -25,13 +25,20 @@ struct SongPickerView: View {
             VStack(spacing: 32) {
                 // Title
                 VStack(spacing: 6) {
-                    Text("universe tune")
-                        .font(.system(size: 13, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.40))
-                        .tracking(6)
+                    Text("METEOR SHOWER")
+                        .font(.system(size: 32, weight: .black, design: .monospaced))
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [.orange, .yellow, .white],
+                                startPoint: .leading, endPoint: .trailing
+                            )
+                        )
+                        .shadow(color: .orange.opacity(0.7), radius: 14)
+                        .shadow(color: .yellow.opacity(0.4), radius: 30)
                     Text("choose your song")
-                        .font(.system(size: 28, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.white)
+                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.40))
+                        .tracking(4)
                 }
 
                 // Song cards
