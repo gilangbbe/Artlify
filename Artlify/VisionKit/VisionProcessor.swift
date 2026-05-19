@@ -32,6 +32,13 @@ public actor VisionProcessor {
 
     private let segmentationRequest: VNGeneratePersonSegmentationRequest
     private let poseRequest: VNDetectHumanBodyPoseRequest
+    private let handRequest: VNDetectHumanHandPoseRequest
+
+    /// Toggleable hand-pose detection. Off by default — the request
+    /// adds measurable cost on top of segmentation + body pose, and
+    /// most installation modes don't need it. Flip on when the
+    /// "hand frame" gesture is active.
+    public var handPoseEnabled: Bool = false
 
     public init(segmentationQuality: VNGeneratePersonSegmentationRequest.QualityLevel = .balanced) {
         let seg = VNGeneratePersonSegmentationRequest()
@@ -39,6 +46,15 @@ public actor VisionProcessor {
         seg.outputPixelFormat = kCVPixelFormatType_OneComponent8
         self.segmentationRequest = seg
         self.poseRequest = VNDetectHumanBodyPoseRequest()
+        let hand = VNDetectHumanHandPoseRequest()
+        hand.maximumHandCount = 2
+        self.handRequest = hand
+    }
+
+    /// Enable/disable hand-pose detection at runtime. Cheap; just
+    /// toggles whether the request is included in the next `perform`.
+    public func setHandPoseEnabled(_ enabled: Bool) {
+        handPoseEnabled = enabled
     }
 
     /// Run segmentation + pose on a single pixel buffer.
@@ -50,7 +66,9 @@ public actor VisionProcessor {
             orientation: .up,
             options: [:]
         )
-        try handler.perform([segmentationRequest, poseRequest])
+        var requests: [VNRequest] = [segmentationRequest, poseRequest]
+        if handPoseEnabled { requests.append(handRequest) }
+        try handler.perform(requests)
 
         // ---- Segmentation
         let mask = (segmentationRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
@@ -72,15 +90,80 @@ public actor VisionProcessor {
             }
         }
 
+        // ---- Hand pose → open-hand detection
+        var handOpen: HandOpenInfo? = nil
+        if handPoseEnabled, let hands = handRequest.results, !hands.isEmpty {
+            // Up to 2 hands; the detector picks the most-open.
+            let obs = hands
+                .sorted { $0.confidence > $1.confidence }
+                .prefix(2)
+                .map { Self.makeObservation(from: $0) }
+            handOpen = HandOpenDetector.detect(Array(obs))
+        }
+
         let dt = CFAbsoluteTimeGetCurrent() - t0
         let frame = VisionFrame(
             personMask: mask,
             joints: joints,
+            handOpen: handOpen,
             processingSeconds: dt,
             sourceWidth: CVPixelBufferGetWidth(pixelBuffer),
             sourceHeight: CVPixelBufferGetHeight(pixelBuffer),
             timestamp: CFAbsoluteTimeGetCurrent()
         )
         return frame
+    }
+
+    /// Pull the wrist + 4 fingertips + 4 MCPs we need from a Vision
+    /// hand-pose observation, with chirality and a mean confidence.
+    private static func makeObservation(
+        from o: VNHumanHandPoseObservation
+    ) -> HandObservation {
+        let chirality: HandObservation.Chirality
+        switch o.chirality {
+        case .left:    chirality = .left
+        case .right:   chirality = .right
+        case .unknown: chirality = .unknown
+        @unknown default: chirality = .unknown
+        }
+
+        func pick(_ name: VNHumanHandPoseObservation.JointName,
+                  minConf: Float = 0.3) -> (CGPoint?, Float) {
+            guard let p = try? o.recognizedPoint(name),
+                  p.confidence >= minConf
+            else { return (nil, 0) }
+            return (p.location, p.confidence)
+        }
+
+        let (wrist, cW) = pick(.wrist)
+        let tipNames: [VNHumanHandPoseObservation.JointName] =
+            [.indexTip, .middleTip, .ringTip, .littleTip]
+        let mcpNames: [VNHumanHandPoseObservation.JointName] =
+            [.indexMCP, .middleMCP, .ringMCP, .littleMCP]
+        var tips: [CGPoint?] = []
+        var mcps: [CGPoint?] = []
+        var confs: [Float] = [cW].filter { $0 > 0 }
+        for n in tipNames {
+            let (p, c) = pick(n)
+            tips.append(p)
+            if c > 0 { confs.append(c) }
+        }
+        for n in mcpNames {
+            let (p, c) = pick(n)
+            mcps.append(p)
+            if c > 0 { confs.append(c) }
+        }
+
+        let mean = confs.isEmpty
+            ? 0
+            : confs.reduce(0, +) / Float(confs.count)
+
+        return HandObservation(
+            chirality: chirality,
+            wrist: wrist,
+            tips: tips,
+            mcps: mcps,
+            confidence: mean
+        )
     }
 }

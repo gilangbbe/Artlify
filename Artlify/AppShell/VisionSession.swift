@@ -99,4 +99,12 @@ final class VisionSession {
         smoothedProcessingSeconds = 0
         passCount = 0
     }
+
+    /// Toggle hand-pose detection on the underlying processor. The
+    /// processor is an actor so the flip happens asynchronously;
+    /// callers shouldn't expect the next single frame to reflect it.
+    func setHandPoseEnabled(_ enabled: Bool) {
+        let processor = self.processor
+        Task { await processor.setHandPoseEnabled(enabled) }
+    }
 }

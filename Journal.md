@@ -15,7 +15,89 @@ Entry template:
 
 ---
 
-## 2026-05-19 — `particles` branch: SCK removal + no-sound fix + Apple Music (MusicKit) integration — karaoke phase 2 cycle complete
+## 2026-05-19 — `particles` branch: scrapped hand-frame, pivoted to open-hand → negative-camera flash
+
+**Decision / change:**
+After shipping the "filmmaker frame" (two-hand L-shape → oriented rectangle revealing live camera) earlier today, hardware-side intuition was that the bimanual L-pose is too brittle: Vision's per-landmark confidences for thumb + indexMCP collapse under installation lighting, and visitors don't reflexively form the gesture. Replaced the whole thing with a much simpler interaction: **open hand → full-screen negative-camera flash**.
+
+- Deleted `Artlify/VisionKit/HandFrame.swift` and `Artlify/RenderKit/HandFrame.metal` outright (the L-shape detector + rectangle Metal pass).
+- New `Artlify/VisionKit/HandOpen.swift` (~140 lines, all `nonisolated`/`Sendable`). `HandObservation` now carries wrist + 4 fingertips ([index, middle, ring, little]) + 4 MCPs (same order); `HandOpenInfo { openness: Float, center: CGPoint, chirality }`. `HandOpenDetector.detect(_ hands: [HandObservation]) -> HandOpenInfo?` picks the most-open hand whose mean extension ratio crosses the threshold. **Extension ratio** = `||tip − wrist|| / ||mcp − wrist||` per finger; closed fist ≈ 1.0, full open palm ≈ 1.8–2.4 (the MCP is roughly halfway out from the wrist, so the tip-to-wrist distance roughly doubles when the finger straightens). Threshold = 1.55 — comfortable margin from accidental triggers, still fires on a casual wave. Requires ≥ 3 of 4 fingers with both tip + MCP confidently tracked (`minConfidence = 0.35`) so a noisy single-finger detection can't pretend to be a palm.
+- New `Artlify/RenderKit/NegativeFlash.metal`. Single fullscreen fragment: samples `cam` at `in.uv`, returns premultiplied `(1 − cam.rgb) * intensity` with `alpha = intensity`. Alpha-blended over the drawable. Discards when `intensity ≤ 0.001`. One texture sample + one subtract per fragment — negligible GPU cost.
+- `VisionKit/VisionProcessor.swift`: the existing `VNDetectHumanHandPoseRequest` (opt-in via `handPoseEnabled`) is unchanged; only the post-processing changed. `makeObservation(from:)` now extracts wrist + all 4 fingertips + all 4 MCPs (`.indexTip / .middleTip / .ringTip / .littleTip` + matching `.indexMCP / .middleMCP / .ringMCP / .littleMCP`) at confidence ≥ 0.3. `process(_:)` calls `HandOpenDetector.detect(Array(top2))` and packs the result onto `VisionFrame.handOpen`.
+- `VisionKit/VisionFrame.swift`: `handFrame: HandFrameInfo?` → `handOpen: HandOpenInfo?`.
+- `RenderKit/CameraMetalRenderer.swift`: pipeline renamed `handFramePipeline` → `negFlashPipeline`, all hand-frame uniforms / bracket knobs / Vision-coord-flip logic removed. New `negFlashEnabled` flag, `setNegFlash(intensity:)` (clamps + caches a one-Float uniform), `encodeNegFlash(_:)` drawn as the same Step 5 (after composite + particles + neg-boxes + ASCII). Private `NegativeFlashUniforms` struct (one Float + 3 pad).
+- `ContentView.swift`: replaced `handFrameEnabled` + `handFrameSmoothQuality` with `negFlashEnabled` + `negFlashIntensity` + `handWasOpen` (rising-edge state) + `negFlashLastTrigger` (rate-limit). In `onChange(of: vision.passCount)`: when `negFlashEnabled`, derive `isOpen = vision.latestFrame?.handOpen != nil`; on the rising edge (`!handWasOpen && isOpen`) AND ≥ 0.55 s since the last kick, set `negFlashIntensity = 1.0` and update `negFlashLastTrigger`. Decay lives in the existing 60 Hz `karaokeTimer.onReceive` — multiplier 0.92/frame → ~0.4 s to 1 %, snapped to 0 when below 0.002 — and pushes `setNegFlash(intensity:)` every frame. HUD toggle re-labelled `neg flash`; its `onChange` flips both `vision.setHandPoseEnabled` and `renderer.negFlashEnabled` together (enabling either alone is a no-op).
+
+**Reason:**
+- Open palm is the most universal "show me" gesture across cultures; visitors do it reflexively and the system reads it from one hand at any orientation. Bimanual L-shape requires explicit instruction.
+- Extension-ratio detection is robust because it's invariant to hand size, distance from camera and screen orientation — the wrist→MCP baseline cancels all of those out. The L-shape detector by contrast depended on absolute thumb-index span as a fraction of frame extent, which is fragile when the hand is far from the camera.
+- The full-screen negative camera as the visual is satisfying: the audience already sees themselves *stylised* in every other pipeline (particles, ASCII, composite); flashing the *literal* inverted camera on top is a brief reminder that there's a real camera under all the art, then it fades and the show resumes. Mechanically it's also the cheapest possible Metal pass.
+- Rising-edge + rate-limit means a held palm fires exactly once per ~0.55 s, so the gesture is a discrete *event* (a "flash"), not a continuous overlay. Decay-by-multiplier makes the flash itself feel like a strobe-soft pulse rather than a hard cut.
+
+**Impact:**
+- Two files deleted, two files added; net file count unchanged.
+- Vision cost path is identical to the prior version (same `VNDetectHumanHandPoseRequest`, same opt-in flag).
+- Metal pass swap: ~5–10× cheaper than the hand-frame pass (no rotation math, no per-corner bracket test, no border-band logic — just one sample + one subtract).
+- HUD label changed from `hand frame` → `neg flash`.
+- Build green with `CODE_SIGNING_ALLOWED=NO`.
+
+**Follow-up:**
+- If installation lighting causes the openness ratio to drift, the two constants (`threshold = 1.55`, `minConfidence = 0.35`) are `static let` and trivially tunable.
+- Could expose the flash colour (currently hard-inverted RGB) and decay rate as HUD knobs if anyone asks.
+- The detector returns a `center` and `chirality`; a future iteration could anchor the flash on the hand instead of full-screen, but full-screen reads strongest right now and matches the "audience sees themselves real, then back to art" beat.
+
+---
+
+
+
+**Decision / change:**
+Three changes in one cycle.
+
+(1) **Killed the `CMIO_DAL_CMIOExtension_Stream.mm:3547:ReceivedSampleBuffer N queue full` log spam + the FPS regression it caused.** The error means the camera extension's upstream sample-buffer queue (between the iPhone Continuity daemon and our AVCaptureSession) overflows. `alwaysDiscardsLateVideoFrames = true` was already set, but that flag only drops late frames *after* they enter our process — the driver-side queue is upstream of it. Two compounding fixes:
+
+   (a) **Cap the camera at 30 fps at the device level.** `CameraCapture.configureLocked` now `device.lockForConfiguration()`s and assigns `activeVideoMin/MaxFrameDuration = CMTime(1, 30)`, clamped to the active format's supported `videoSupportedFrameRateRanges` so non-Continuity devices that don't accept arbitrary durations can't throw. Continuity defaults to delivering up to 60 fps, which our compositor + Vision + SwiftUI overlay stack can't drain. Capping at the source tells the camera daemon "don't bother", and the upstream queue stops filling.
+
+   (b) **Flush `CVMetalTextureCache` per submit.** Each call to `CVMetalTextureCacheCreateTextureFromImage` keeps an internal cache entry that pins the source `IOSurface`. Without periodic flushing those surfaces don't return to the camera's pool fast enough — once the pool runs out, the daemon has nowhere to write the next frame and emits the queue-full error. `submit(_:)` and `submitMask(_:)` now call `CVMetalTextureCacheFlush(cache, 0)` immediately after creating the new texture (the just-created entry stays alive because it's still referenced by the `tex` variable we just assigned).
+
+(2) **Toggle for KaraokeOverlay's layer 3 (the loud chromatic + chaos current-line text).** Hardware testing on the installation revealed that the giant centred lyric — exactly the layer with chromatic aberration + per-glyph transient explosion + camera shake — can overpower the rest of the visual when the song carries a strong vocal. Added `var showCurrentLine: Bool = true` to `KaraokeOverlay`; gated the existing `drawCurrentLine` call on it. The four quieter layers (world ghost fragments, prev/next satellites, slice tear, bloom) keep running independently. New HUD toggle `layer 3 lyric` (next to the new hand-frame toggle) lets the operator decide per-song / per-vibe. Default `true` preserves current behaviour.
+
+(3) **"Filmmaker frame" gesture — hand L-shapes punch a live-camera window through the stylised scene.** The full slice:
+
+   - **`VisionKit/HandFrame.swift`** (new, ~180 lines). Pure / `nonisolated` types: `HandObservation` (chirality + wrist + thumbTip + indexTip + indexMCP + mean confidence — all optional because Vision returns per-landmark confidences and a partially-occluded hand can drop any one); `HandFrameInfo` (centre + halfSize + rotation angle + 4 corner array + quality 0…1). `HandFrameDetector.detect(_ a, _ b)` static method: gates each hand on (i) thumb-wrist-index angle in [50°, 130°], (ii) thumb-tip → index-tip span ≥ 4 % of frame extent, then gates the pair on (iii) diagonal between the two "inside corners" (indexMCP, falling back to wrist) ≥ 15 % of frame extent. Derivation: the two inside-corner anchors are treated as two **opposite corners** of the rectangle — the honest geometric interpretation, and it sidesteps "what aspect ratio did the user mean" entirely. Rectangle is a square with half-extent `D / (2√2)`, rotated so its corners coincide exactly with the two anchors. Quality score blends "L-angle proximity to 90°" (60 %) with mean landmark confidence (40 %).
+
+   - **`VisionKit/VisionProcessor.swift`** extended. Added `VNDetectHumanHandPoseRequest` (`maximumHandCount = 2`) alongside the existing segmentation + body-pose requests. New `handPoseEnabled: Bool` actor-isolated flag (off by default — the request is non-trivial cost on top of `.balanced` segmentation + body pose, and most modes don't need it). `process(_:)` conditionally appends the hand request to the `try handler.perform([...])` call. After `perform`, if both hands came back the top-two-by-confidence get pulled into `HandObservation`s via `recognizedPoint(.wrist / .thumbTip / .indexTip / .indexMCP)` (each gated at confidence ≥ 0.3), then handed to `HandFrameDetector.detect`. Result goes into a new `handFrame: HandFrameInfo?` field on `VisionFrame`.
+
+   - **`AppShell/VisionSession.swift`** got a public `setHandPoseEnabled(_:)` that dispatches into the processor actor.
+
+   - **`RenderKit/HandFrame.metal`** (new, ~110 lines). Single fullscreen fragment pass. Uniforms: `center` (uv), `halfSize` (uv), `cosA` / `sinA` (rotation about centre), `borderHalfWidth`, `bracketLen`, `intensity`. Logic per fragment: rotate `(fragment.uv − centre)` into rectangle-local space; if `|local| ≤ halfSize` → sample `cam` at the **unmodified screen uv** (so the rectangle reveals exactly the world position the hands frame — the "lens" reading of the gesture, where the rectangle shows reality behind the stylised scene rather than a magnified copy of itself) with a subtle inner-edge darkening for readability; else if inside the inflated rect → only draw inside the four corner bracket segments (an L of length `bracketLen` along each adjacent edge from each corner); else `discard_fragment()`. Output is premultiplied amber `(1.0, 0.78, 0.18)` for the brackets, opaque camera for the inside, with the whole pass faded by `intensity` so the rectangle eases in/out instead of popping.
+
+   - **`RenderKit/CameraMetalRenderer.swift`** extended. New `handFramePipeline` (built from `handframe_fragment` + the existing `passthrough_vertex`, alpha-blended over the drawable), `handFrameEnabled` public flag, `handFrameBorderHalfWidth` (0.006 uv default ≈ 4 px on 720p) + `handFrameBracketFraction` (0.22 default) tuning knobs, `handFrameIntensity` published read-only, `handFrameUniforms` private cache. New `setHandFrame(_:intensity:)` API: takes Vision-coord `HandFrameInfo?` and an intensity, performs the y-flip (Vision is y-up, screen uv is y-down) + angle negation into screen space, packs the uniforms; passing `nil` (or intensity ≤ 0) clears the pass. `encodeHandFrame(_:)` draws the fullscreen triangle with those uniforms as Step 5 of `draw(in:)`, after composite + particles + negative-boxes + ASCII so the viewfinder always reads on top.
+
+   - **`ContentView.swift`** wiring. New `@State handFrameEnabled` + `@State handFrameSmoothQuality: Float = 0`. HUD got a third toggle row (next to layer-3-lyric) with `hand frame` toggle whose `onChange` calls `vision.setHandPoseEnabled(on) + session.renderer.handFrameEnabled = on` together (enabling either alone is a no-op; the Vision cost is the expensive half so we don't pay it unless the user wants it). The existing `.onChange(of: vision.passCount)` callback (which already pushes the mask + body anchor + blobs every Vision pass) gained a fourth side-effect: when `handFrameEnabled`, EMA-smooth the detector's `quality` with α = 0.25 (so a single dropout frame can't collapse the rectangle to zero) and forward `(handFrame, smoothedQuality)` to `setHandFrame(_:intensity:)`. Disabling the toggle clears the smoothed value and pushes `nil`.
+
+**Reason:**
+- The CMIO error was actively degrading FPS during the karaoke / MusicKit demo. The cap-at-30-fps fix is the canonical "tell the daemon to slow down" lever; the cache flush is the Apple-documented "return surfaces to the pool" pattern. Together they make the producer side bulletproof regardless of how heavy the consumer (main-thread compositor + overlays) gets.
+- The layer-3 toggle came directly from the user: "sometimes its just too much". One boolean and a HUD toggle — disproportionately good UX gain for the bytes.
+- The hand-frame gesture is the next step in the installation's interaction vocabulary: the visitor isn't just *seen* by the system, they get a physical way to *direct* what's revealed. "Filmmaker frame" is intuitive (it's a real-world gesture every photographer knows), bimanual (so it can't be triggered accidentally — both hands need to commit), and the visual outcome is legible at a glance (the rectangle literally shows the camera). Building the detection as a pure function + the renderer pass as a single fragment shader keeps it composable: it sits on top of every other pipeline (particles, composite, ASCII, …) without touching them.
+
+**Impact:**
+- `CameraCapture.swift` now caps device fps; renderer flushes its cache per submit. Net effect: no more `queue full` log lines, no more associated FPS drop.
+- KaraokeOverlay gained one `Bool` knob; existing API unchanged for callers that don't pass it.
+- Vision pipeline gained an opt-in third request, opt-in via the new flag — off by default → existing performance unchanged. When the user flips `hand frame` on, processing cost rises (one additional Vision request per pass) but the 15 Hz cap on `VisionSession` still absorbs it comfortably on M-series.
+- New Metal pass adds one fullscreen triangle per draw when the gesture is held; trivial GPU cost (~0.1 ms on M-series).
+- HUD picked up two new toggles in a single row.
+- Total new files: `Artlify/VisionKit/HandFrame.swift`, `Artlify/RenderKit/HandFrame.metal`.
+- Build green with `CODE_SIGNING_ALLOWED=NO`.
+
+**Follow-up:**
+- If the L-shape detector misfires in real installation lighting, the three tuning constants (`minSpan`, `minDiagonal`, `minAngleDeg`/`maxAngleDeg`) are `static let` in `HandFrameDetector` and trivially adjustable.
+- The current frame is a **square** anchored on the two inside-corner anchors. A future iteration could let the user pick aspect ratio by extending one finger further than the other (e.g. derive halfW / halfH separately from the per-hand span). Out of scope for this slice — square reads cleanly.
+- Inside the rectangle we currently show the camera at `in.uv` — meaning the gesture is a "lens" onto reality (the framed area shows the unprocessed camera underneath the stylised scene). An alternative reading would be to remap so the rectangle shows a *zoomed crop* of whatever lies between the hands. Both are interesting; the lens reading shipped because it's geometrically honest (the camera shows up exactly where the hands frame).
+- A subsequent slice could feed the detected rectangle back into the diffusion pipeline (e.g. style the framed area only) once the diffusion branch and the particles branch reconverge.
+
+---
+
+
 
 **Decision / change:**
 Three changes in one slice that together close out karaoke phase 2 for the installation deployment.

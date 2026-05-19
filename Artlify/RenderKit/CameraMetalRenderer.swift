@@ -35,6 +35,7 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     private let trailDecayPipeline: MTLRenderPipelineState
     private let negativeBoxesPipeline: MTLRenderPipelineState
     private let asciiPipeline: MTLRenderPipelineState
+    private let negFlashPipeline: MTLRenderPipelineState
     private let asciiAtlasTexture: MTLTexture?
     private var textureCache: CVMetalTextureCache?
 
@@ -113,12 +114,62 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
     public var asciiColorHigh: SIMD3<Float> = SIMD3<Float>(0.85, 1.00, 0.70)
     private var asciiShockBirth: CFAbsoluteTime = -1000
 
+    /// Negative-camera full-screen flash. When `negFlashEnabled` is
+    /// true, callers push a 0…1 intensity each frame via
+    /// `setNegFlash(intensity:)`; the pass fades the inverted live
+    /// camera over the stylised scene. Driven by the open-hand
+    /// gesture from VisionKit/HandOpen.
+    public var negFlashEnabled: Bool = false
+    /// 0..1 current fade. Read-only; updated by `setNegFlash`.
+    public private(set) var negFlashIntensity: Float = 0
+    /// RGB multiplier on the inverted image. (1,1,1) = pure photo
+    /// negative. Push other values to tint the flash (e.g. amber for
+    /// a vintage darkroom feel). Live-tunable from the HUD.
+    public var negFlashTint: SIMD3<Float> = SIMD3<Float>(1, 1, 1)
+    private var negFlashUniforms: NegativeFlashUniforms?
+
     /// Restart the ASCII shockwave ring at `origin` (uv). Idempotent;
     /// safe to call every frame — the renderer will only honour it
     /// when audio actually fires a transient (caller's decision).
     public func triggerAsciiShockwave(origin: SIMD2<Float>) {
         asciiOrigin = origin
         asciiShockBirth = CFAbsoluteTimeGetCurrent()
+    }
+
+    /// Push the latest negative-flash intensity (0…1). Clamps + caches
+    /// the uniform for the next draw; passing 0 (or with the flag
+    /// disabled) silences the pass.
+    public func setNegFlash(intensity: Float) {
+        guard negFlashEnabled else {
+            negFlashUniforms = nil
+            negFlashIntensity = 0
+            return
+        }
+        let i = max(0, min(1, intensity))
+        negFlashIntensity = i
+        negFlashUniforms = NegativeFlashUniforms(
+            intensity: i,
+            _pad0: 0,
+            _pad1: SIMD2<Float>(0, 0),
+            tint:  negFlashTint,
+            _pad2: 0
+        )
+    }
+
+    /// Encode the negative-flash pass on top of the existing scene.
+    /// No-op when disabled or intensity has decayed to ~0.
+    private func encodeNegFlash(_ enc: MTLRenderCommandEncoder) {
+        guard negFlashEnabled,
+              var u = negFlashUniforms,
+              u.intensity > 0.001,
+              let cam = latestCameraTexture
+        else { return }
+        enc.setRenderPipelineState(negFlashPipeline)
+        enc.setFragmentTexture(cam, index: 0)
+        enc.setFragmentBytes(&u,
+                             length: MemoryLayout<NegativeFlashUniforms>.stride,
+                             index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
     }
 
     public private(set) var drawnFrames: Int = 0
@@ -139,7 +190,8 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
             let cfn = library.makeFunction(name: "composite_fragment"),
             let tfn = library.makeFunction(name: "trail_decay_fragment"),
             let nfn = library.makeFunction(name: "negative_boxes_fragment"),
-            let afn = library.makeFunction(name: "ascii_fragment")
+            let afn = library.makeFunction(name: "ascii_fragment"),
+            let hfn = library.makeFunction(name: "negflash_fragment")
         else {
             throw RendererError.shaderNotFound
         }
@@ -202,6 +254,25 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         }
         self.asciiPipeline = try device.makeRenderPipelineState(descriptor: adesc)
         self.asciiAtlasTexture = AsciiAtlas.makeTexture(device: device)
+
+        // Hand-frame pass: standard alpha blend over the drawable.
+        // The shader writes premultiplied colour for both the camera
+        // window (alpha = intensity) and the corner brackets so the
+        // fade-in/fade-out reads cleanly against the scene below.
+        let hdesc = MTLRenderPipelineDescriptor()
+        hdesc.vertexFunction = vfn
+        hdesc.fragmentFunction = hfn
+        hdesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        if let hca = hdesc.colorAttachments[0] {
+            hca.isBlendingEnabled = true
+            hca.rgbBlendOperation = .add
+            hca.alphaBlendOperation = .add
+            hca.sourceRGBBlendFactor = .one
+            hca.sourceAlphaBlendFactor = .one
+            hca.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            hca.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
+        self.negFlashPipeline = try device.makeRenderPipelineState(descriptor: hdesc)
 
         var cache: CVMetalTextureCache?
         let status = CVMetalTextureCacheCreate(
@@ -547,6 +618,10 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
                 let ad = particleField?.audioReactor?.latest ?? .zero
                 let aStrength = particleField?.audioStrength ?? 0
                 encodeAscii(enc, viewport: viewport, audio: ad, audioStrength: aStrength)
+                // Pass F: negative-camera flash on top — also needed
+                // here because the trails path uses a separate encoder
+                // from the no-trails path below.
+                encodeNegFlash(enc)
                 enc.endEncoding()
             }
             drawnFrames += 1
@@ -616,6 +691,11 @@ public final class CameraMetalRenderer: NSObject, MTKViewDelegate {
         let aStrength = particleField?.audioStrength ?? 0
         encodeAscii(enc, viewport: viewport, audio: ad, audioStrength: aStrength)
 
+        // Step 5: hand-frame viewfinder — punches a camera-content
+        // window through whatever the previous steps drew. Drawn
+        // last so it always reads on top.
+        encodeNegFlash(enc)
+
         reportFPSIfNeeded()
 
         enc.endEncoding()
@@ -683,6 +763,17 @@ private struct CompositeUniforms {
     var style_strength: Float
     var mask_mode: Float
     var mask_softness: Float
+}
+
+/// Must match the layout of the Metal `NegativeFlashUniforms`
+/// struct in NegativeFlash.metal. Padded to 32 bytes so the
+/// `float3 tint` lands on its 16-byte boundary on every GPU.
+private struct NegativeFlashUniforms {
+    var intensity: Float    // 0..1 fade envelope
+    var _pad0:     Float
+    var _pad1:     SIMD2<Float>
+    var tint:      SIMD3<Float>   // RGB multiplier on the inverted image
+    var _pad2:     Float
 }
 
 /// Where the stylized layer is applied relative to the person mask.

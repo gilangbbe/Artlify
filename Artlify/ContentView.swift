@@ -47,6 +47,10 @@ struct ContentView: View {
     @State private var blobsStrings: Bool = true
     @State private var karaoke = KaraokeStore()
     @State private var karaokeEnabled: Bool = false
+    /// When false, KaraokeOverlay's loud layer-3 (chromatic + chaos
+    /// current-line text) is suppressed while the quieter layers (world
+    /// fragments, prev/next satellites, slice tear, bloom) keep running.
+    @State private var karaokeCurrentLineEnabled: Bool = true
     @State private var karaokePlaying: Bool = false
     /// Wall-clock time of the last karaoke advance tick, used to
     /// integrate `karaoke.currentTime` at 1× between repaints.
@@ -68,6 +72,34 @@ struct ContentView: View {
     @State private var currentTrackTitle: String? = nil
     @State private var asciiHue: Double = 0.33   // green default
 
+    /// Open-hand gesture → full-screen negative-camera flash. When
+    /// on, Vision runs `VNDetectHumanHandPoseRequest` alongside body
+    /// pose; whenever a hand opens (rising edge), the renderer kicks
+    /// a fade-in of the inverted live camera over the stylised scene.
+    @State private var negFlashEnabled: Bool = false
+    /// Current 0…1 flash envelope. Kicked to `negFlashPeak` on a
+    /// rising-edge open-hand and decayed each frame so the flash
+    /// blooms in and out by itself.
+    @State private var negFlashIntensity: Float = 0
+    /// Peak opacity reached on trigger (0…1). 1.0 = full inversion
+    /// pop; lower values feel like a soft strobe over the scene.
+    @State private var negFlashPeak: Double = 1.0
+    /// Per-frame decay multiplier (0…1). Higher = slower fade.
+    /// 0.92 ≈ 0.4 s half-life at 60 Hz; 0.97 ≈ 1.5 s.
+    @State private var negFlashFade: Double = 0.92
+    /// Hue of the tint multiplied onto the inverted image (0…1).
+    /// Saturation 0 → the slider is ignored and the flash stays a
+    /// pure photo-negative; >0 starts colouring the inversion.
+    @State private var negFlashHue: Double = 0.08         // amber default
+    @State private var negFlashSaturation: Double = 0.0   // off by default → pure inversion
+    /// True while the last Vision pass reported an open hand — used
+    /// for rising-edge detection so a held-open palm fires once, not
+    /// every frame.
+    @State private var handWasOpen: Bool = false
+    /// Wall-clock of the last flash kick; rate-limits to one flash
+    /// per ~0.55 s so a slow open-close-open doesn't strobe.
+    @State private var negFlashLastTrigger: CFAbsoluteTime = 0
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             CameraMetalView(renderer: session.renderer)
@@ -86,6 +118,7 @@ struct ContentView: View {
             if karaokeEnabled {
                 GeometryReader { proxy in
                     KaraokeOverlay(store: karaoke,
+                                   showCurrentLine: karaokeCurrentLineEnabled,
                                    audioLevel: Double(audio.latest.level),
                                    audioLow: Double(audio.latest.low),
                                    audioMid: Double(audio.latest.mid),
@@ -187,6 +220,20 @@ struct ContentView: View {
             // Push fresh joint samples into the blob-box store so
             // each tracked body point's bounding box follows the body.
             updateBlobs()
+            // Open-hand gesture → kick the negative-flash envelope on
+            // the rising edge (closed/absent → open transition). The
+            // envelope itself decays on the karaoke 60 Hz timer below.
+            if negFlashEnabled {
+                let isOpen = vision.latestFrame?.handOpen != nil
+                if isOpen, !handWasOpen {
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - negFlashLastTrigger > 0.55 {
+                        negFlashIntensity = Float(negFlashPeak)
+                        negFlashLastTrigger = now
+                    }
+                }
+                handWasOpen = isOpen
+            }
         }
         // Periodically flash 1–3 negative-camera boxes around random
         // body joints. Empty frames (no joints) are silently skipped.
@@ -203,6 +250,15 @@ struct ContentView: View {
             let now = CFAbsoluteTimeGetCurrent()
             let dt = now - karaokeLastTick
             karaokeLastTick = now
+            // Decay the negative-flash envelope independent of the
+            // karaoke transport so the flash blooms even with no song
+            // loaded. Multiplier 0.92 @ 60 Hz \u2248 0.4 s to 1% \u2014 long
+            // enough to read clearly, short enough not to overstay.
+            if negFlashEnabled {
+                negFlashIntensity *= Float(negFlashFade)
+                if negFlashIntensity < 0.002 { negFlashIntensity = 0 }
+                session.renderer.setNegFlash(intensity: negFlashIntensity)
+            }
             guard karaokeEnabled else { return }
             // Priority order for who owns the timeline:
             //   1. MusicKit  (Apple Music — polled from daemon)
@@ -301,13 +357,26 @@ struct ContentView: View {
 
     @ViewBuilder
     private var statusHUD: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(statusText)
-                .font(.system(.caption, design: .monospaced))
-            if let device = session.activeDeviceName {
-                Text("device: \(device)")
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(LinearGradient(
+                        colors: [.orange, .pink],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing))
+                    .frame(width: 8, height: 8)
+                Text("ARTLIFY")
+                    .font(.system(.caption, design: .monospaced).weight(.bold))
+                    .tracking(2.4)
+                    .foregroundStyle(.primary)
+                Text(statusText)
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
+            }
+            if let device = session.activeDeviceName {
+                Text("device  ·  \(device)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
             }
             visionStatusLine
             HStack(spacing: 6) {
@@ -346,8 +415,16 @@ struct ContentView: View {
                 .controlSize(.small)
             }
         }
-        .padding(8)
-        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(.white.opacity(0.10), lineWidth: 0.5)
+                )
+                .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 4)
+        )
         .foregroundStyle(.white)
     }
 
@@ -566,6 +643,16 @@ struct ContentView: View {
 
             karaokeRow
 
+            negFlashCard
+
+            HStack(spacing: 12) {
+                Toggle("layer 3 lyric", isOn: $karaokeCurrentLineEnabled)
+                    .toggleStyle(.button)
+                    .controlSize(.small)
+                    .help("Toggle the big chromatic current-line text in the karaoke overlay. Off keeps the quieter background layers.")
+                Spacer()
+            }
+
             audioRow(field: field)
 
             HStack(spacing: 12) {
@@ -588,8 +675,16 @@ struct ContentView: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(12)
-        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(.white.opacity(0.10), lineWidth: 0.5)
+                )
+                .shadow(color: .black.opacity(0.40), radius: 16, x: 0, y: 6)
+        )
         .foregroundStyle(.white)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -750,6 +845,128 @@ struct ContentView: View {
         let mm = Int(secs) / 60
         let ss = Int(secs) % 60
         return String(format: "%d:%02d", mm, ss)
+    }
+
+    // MARK: - Negative-flash gesture card
+
+    /// Convert the HUD's hue + saturation knobs into an RGB multiplier
+    /// for the inverted image. Saturation 0 collapses to (1,1,1) which
+    /// gives a pure photo-negative; >0 begins colour-tinting the flash.
+    private var negFlashTint: SIMD3<Float> {
+        let c = Color(hue: negFlashHue,
+                      saturation: negFlashSaturation,
+                      brightness: 1.0)
+        let ns = NSColor(c).usingColorSpace(.deviceRGB) ?? NSColor.white
+        return SIMD3<Float>(Float(ns.redComponent),
+                            Float(ns.greenComponent),
+                            Float(ns.blueComponent))
+    }
+
+    /// Push the latest tint to the renderer and re-emit the current
+    /// envelope so the live frame reflects the new colour immediately.
+    private func pushNegFlashTint() {
+        session.renderer.negFlashTint = negFlashTint
+        session.renderer.setNegFlash(intensity: negFlashIntensity)
+    }
+
+    @ViewBuilder
+    private var negFlashCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: "hand.raised.fill")
+                    .font(.caption)
+                    .foregroundStyle(negFlashEnabled ? .orange : .secondary)
+                Text("OPEN-HAND FLASH")
+                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Toggle("", isOn: $negFlashEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .controlSize(.mini)
+                    .help("Open hand → full-screen negative-camera flash. Vision must run hand-pose alongside body pose; off by default to save Vision cost.")
+                    .onChange(of: negFlashEnabled) { _, on in
+                        vision.setHandPoseEnabled(on)
+                        session.renderer.negFlashEnabled = on
+                        if on {
+                            pushNegFlashTint()
+                        } else {
+                            handWasOpen = false
+                            negFlashIntensity = 0
+                            session.renderer.setNegFlash(intensity: 0)
+                        }
+                    }
+            }
+
+            if negFlashEnabled {
+                HStack(spacing: 14) {
+                    flashSlider(label: "peak",
+                                value: $negFlashPeak,
+                                range: 0.2...1.0,
+                                fmt: "%.2f")
+                    flashSlider(label: "fade",
+                                value: $negFlashFade,
+                                range: 0.80...0.985,
+                                fmt: "%.3f")
+                    flashSlider(label: "hue",
+                                value: $negFlashHue,
+                                range: 0...1,
+                                fmt: "%.2f")
+                        .onChange(of: negFlashHue) { _, _ in pushNegFlashTint() }
+                    flashSlider(label: "tint",
+                                value: $negFlashSaturation,
+                                range: 0...1,
+                                fmt: "%.2f")
+                        .onChange(of: negFlashSaturation) { _, _ in pushNegFlashTint() }
+                    Circle()
+                        .fill(Color(hue: negFlashHue,
+                                    saturation: negFlashSaturation,
+                                    brightness: 1.0))
+                        .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+                        .frame(width: 18, height: 18)
+                    Button {
+                        negFlashIntensity = Float(negFlashPeak)
+                        session.renderer.setNegFlash(intensity: negFlashIntensity)
+                    } label: {
+                        Label("test", systemImage: "bolt.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Manually trigger the flash without needing the gesture.")
+                    Spacer()
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.white.opacity(0.08), lineWidth: 0.5)
+                )
+        )
+    }
+
+    @ViewBuilder
+    private func flashSlider(label: String,
+                             value: Binding<Double>,
+                             range: ClosedRange<Double>,
+                             fmt: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text(label)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text(String(format: fmt, value.wrappedValue))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.primary)
+            }
+            Slider(value: value, in: range)
+                .controlSize(.mini)
+                .frame(width: 110)
+        }
     }
 
     @ViewBuilder

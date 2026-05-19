@@ -31,6 +31,10 @@ nonisolated public struct VisionFrame: @unchecked Sendable {
     public let personMask: CVPixelBuffer?
     /// Detected body-pose joints (normalized). Empty if no person found.
     public let joints: [VisionJoint]
+    /// Detected open-hand summary (most-open hand in frame). nil when
+    /// no hand crosses the openness threshold or hand-pose detection
+    /// is disabled.
+    public let handOpen: HandOpenInfo?
     /// Wall-clock seconds for the full processing pass (seg + pose).
     public let processingSeconds: Double
     /// Source frame width/height in pixels (used by overlay code to
@@ -42,12 +46,14 @@ nonisolated public struct VisionFrame: @unchecked Sendable {
 
     nonisolated public init(personMask: CVPixelBuffer?,
                 joints: [VisionJoint],
+                handOpen: HandOpenInfo? = nil,
                 processingSeconds: Double,
                 sourceWidth: Int,
                 sourceHeight: Int,
                 timestamp: CFAbsoluteTime) {
         self.personMask = personMask
         self.joints = joints
+        self.handOpen = handOpen
         self.processingSeconds = processingSeconds
         self.sourceWidth = sourceWidth
         self.sourceHeight = sourceHeight

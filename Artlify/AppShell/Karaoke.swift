@@ -228,6 +228,12 @@ final class KaraokeStore {
 /// without touching this file.
 struct KaraokeOverlay: View {
     let store: KaraokeStore
+    /// When false, layer 3 (the loud chromatic + chaos current-line
+    /// text) is suppressed entirely — layers 1 (world fragments),
+    /// 2 (prev/next satellites), 4a (slice tear) and 4b (bloom) keep
+    /// running. Useful for installations where the giant centred
+    /// lyric overpowers the visual.
+    var showCurrentLine: Bool = true
     /// 0..1 normalised broadband level — drives base amplitudes.
     var audioLevel: Double = 0
     /// 0..1 low-band energy — drives the bass "breathing" of the
@@ -301,7 +307,7 @@ struct KaraokeOverlay: View {
             drawSliceTear(ctx: ctx, size: size, centerY: centerY)
 
             // ---- (3) Current line — chromatic + chaos + highlight.
-            if !curr.isEmpty {
+            if showCurrentLine, !curr.isEmpty {
                 drawCurrentLine(curr, ctx: ctx, size: size,
                                 centerY: centerY)
             }
