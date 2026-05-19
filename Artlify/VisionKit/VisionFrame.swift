@@ -17,11 +17,21 @@ nonisolated public struct VisionJoint: Sendable, Identifiable {
     public let id: String           // raw VNHumanBodyPoseObservation joint name
     public let point: CGPoint       // normalized (0…1), Vision-coordinates
     public let confidence: Float    // 0…1
+    /// Which detected person this joint belongs to (0…N−1). Multiple
+    /// people in frame each get a stable index for the lifetime of one
+    /// VisionFrame; downstream consumers can namespace per-person state
+    /// (e.g. blob tracking) with this without doing the matching
+    /// themselves.
+    public let personIndex: Int
 
-    nonisolated public init(id: String, point: CGPoint, confidence: Float) {
+    nonisolated public init(id: String,
+                            point: CGPoint,
+                            confidence: Float,
+                            personIndex: Int = 0) {
         self.id = id
         self.point = point
         self.confidence = confidence
+        self.personIndex = personIndex
     }
 }
 

@@ -73,18 +73,23 @@ public actor VisionProcessor {
         // ---- Segmentation
         let mask = (segmentationRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
 
-        // ---- Pose
+        // ---- Pose (multi-person). Vision returns one observation per
+        // detected body; we tag every joint with its observation index
+        // so downstream consumers can namespace per-person state. Cap
+        // at 4 bodies — enough for a small group in front of a single
+        // installation camera, low enough to keep per-frame cost bounded.
         var joints: [VisionJoint] = []
-        if let observation = poseRequest.results?.first {
-            // Pull every recognized joint above a small confidence floor.
+        let bodies = (poseRequest.results ?? []).prefix(4)
+        for (idx, observation) in bodies.enumerated() {
             let recognized = (try? observation.recognizedPoints(.all)) ?? [:]
-            joints.reserveCapacity(recognized.count)
+            joints.reserveCapacity(joints.count + recognized.count)
             for (jointName, point) in recognized where point.confidence >= 0.2 {
                 joints.append(
                     VisionJoint(
                         id: jointName.rawValue.rawValue,
                         point: point.location,
-                        confidence: point.confidence
+                        confidence: point.confidence,
+                        personIndex: idx
                     )
                 )
             }

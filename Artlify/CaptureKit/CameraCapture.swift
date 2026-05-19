@@ -297,6 +297,18 @@ nonisolated public final class CameraCapture: NSObject, @unchecked Sendable {
             }
             session.addOutput(output)
         }
+
+        // Selfie-mirror the capture at the connection level. Doing it
+        // here means everything downstream — Vision (mask + joints),
+        // every Metal pass, every SwiftUI overlay — receives already-
+        // mirrored pixels and stays automatically coherent. No
+        // shader-side flip, no per-overlay coordinate flip. Disable
+        // automatic adjustment first so our explicit setting sticks.
+        if let connection = output.connection(with: .video),
+           connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = true
+        }
     }
 
     private func pickDevice(preferredID: String?) -> AVCaptureDevice? {

@@ -1132,12 +1132,15 @@ struct ContentView: View {
     /// Pull confident joints from the latest Vision frame, flip
     /// Vision's bottom-left y to top-left uv, push positions into the
     /// store. The flash gate is driven separately on the box timer.
+    /// Namespaces each joint id with its personIndex so multiple
+    /// people in frame each get an independent set of tracked blobs
+    /// rather than fighting over the same `"left_wrist"` slot.
     private func updateBlobs() {
         guard blobsEnabled, let f = vision.latestFrame else { return }
         let samples: [(id: String, uv: SIMD2<Float>)] = f.joints
             .filter { $0.confidence >= 0.4 }
             .map { j in
-                (id: j.id,
+                (id: "p\(j.personIndex)/\(j.id)",
                  uv: SIMD2<Float>(Float(j.point.x),
                                   Float(1.0 - j.point.y)))
             }
