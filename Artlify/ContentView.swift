@@ -100,10 +100,57 @@ struct ContentView: View {
     /// per ~0.55 s so a slow open-close-open doesn't strobe.
     @State private var negFlashLastTrigger: CFAbsoluteTime = 0
 
+    // MARK: - Background controls
+
+    /// Solid colour scrim drawn between the camera layer and the
+    /// foreground overlays. At `bgOpacity == 0` it does nothing;
+    /// dialled up it fades the live camera toward this colour without
+    /// affecting Vision or the overlays riding above it.
+    @State private var bgColor: Color = .black
+    /// 0… 1 alpha of the background scrim. Default 0 → camera is
+    /// untouched out of the box.
+    @State private var bgOpacity: Double = 0
+
+    /// Toggleable counter-depth ASCII environment that sits BEHIND
+    /// every foreground overlay but in front of the camera scrim.
+    /// See `AsciiDepthBackground` for the depth-field details.
+    @State private var asciiDepthEnabled: Bool = false
+    @State private var asciiDepthHue: Double = 0.55         // phosphor cyan
+    @State private var asciiDepthSaturation: Double = 0.65
+    @State private var asciiDepthBrightness: Double = 0.85
+    @State private var asciiDepthDensity: Double = 0.45
+    @State private var asciiDepthCollapse: Double = 0.75
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             CameraMetalView(renderer: session.renderer)
                 .ignoresSafeArea()
+
+            // Solid-colour scrim between camera and overlays. Drawn
+            // before the ASCII background so dialling up `bgOpacity`
+            // mutes the camera underneath the depth field rather
+            // than tinting through it.
+            if bgOpacity > 0.001 {
+                bgColor
+                    .opacity(bgOpacity)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+
+            // Counter-depth ASCII background. Hollow centre, dense
+            // rushing edges, pulsing outward — reads as inside-out
+            // space whose vanishing point is on YOUR side of the
+            // screen.
+            if asciiDepthEnabled {
+                AsciiDepthBackground(
+                    hue: asciiDepthHue,
+                    saturation: asciiDepthSaturation,
+                    brightness: asciiDepthBrightness,
+                    density: asciiDepthDensity,
+                    collapse: asciiDepthCollapse
+                )
+                .ignoresSafeArea()
+            }
 
             if blobsEnabled {
                 GeometryReader { proxy in
@@ -154,6 +201,18 @@ struct ContentView: View {
             if showHUD {
                 statusHUD
                     .padding(12)
+
+                // Top-right: background scrim + ASCII counter-depth
+                // controls. Lives in its own column so it never
+                // crowds the device / Vision row on the left.
+                VStack {
+                    HStack {
+                        Spacer()
+                        backgroundPanel
+                            .padding(12)
+                    }
+                    Spacer()
+                }
 
                 VStack {
                     Spacer()
@@ -947,6 +1006,105 @@ struct ContentView: View {
                         .strokeBorder(.white.opacity(0.08), lineWidth: 0.5)
                 )
         )
+    }
+
+    // MARK: - Background panel (top-right HUD card)
+
+    /// Compact card exposing the background scrim (colour + opacity)
+    /// and the toggleable ASCII counter-depth environment. Mirrors
+    /// the `.white.opacity(0.04)` card chrome used elsewhere in the
+    /// HUD so the panels feel like one set.
+    @ViewBuilder
+    private var backgroundPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.fill")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+                Text("BACKGROUND")
+                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                // Native colour picker — supportsOpacity:false because
+                // we expose opacity on a dedicated slider so the user
+                // can see the numeric value.
+                ColorPicker("color",
+                            selection: $bgColor,
+                            supportsOpacity: false)
+                    .labelsHidden()
+                    .frame(width: 28, height: 18)
+                flashSlider(label: "opacity",
+                            value: $bgOpacity,
+                            range: 0...1,
+                            fmt: "%.2f")
+                Spacer()
+            }
+
+            Divider().opacity(0.25)
+
+            HStack(spacing: 8) {
+                Image(systemName: "scope")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+                Text("ASCII DEPTH")
+                    .font(.system(.caption2, design: .monospaced).weight(.semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Toggle("", isOn: $asciiDepthEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .controlSize(.mini)
+                    .help("Counter-depth ASCII environment. Hollow centre, rushing edges — feels inside-out.")
+            }
+
+            if asciiDepthEnabled {
+                HStack(spacing: 14) {
+                    flashSlider(label: "hue",
+                                value: $asciiDepthHue,
+                                range: 0...1,
+                                fmt: "%.2f")
+                    flashSlider(label: "sat",
+                                value: $asciiDepthSaturation,
+                                range: 0...1,
+                                fmt: "%.2f")
+                    Circle()
+                        .fill(Color(hue: asciiDepthHue,
+                                    saturation: asciiDepthSaturation,
+                                    brightness: 1.0))
+                        .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+                        .frame(width: 18, height: 18)
+                }
+                HStack(spacing: 14) {
+                    flashSlider(label: "bright",
+                                value: $asciiDepthBrightness,
+                                range: 0...1,
+                                fmt: "%.2f")
+                    flashSlider(label: "density",
+                                value: $asciiDepthDensity,
+                                range: 0...1,
+                                fmt: "%.2f")
+                    flashSlider(label: "collapse",
+                                value: $asciiDepthCollapse,
+                                range: 0...1,
+                                fmt: "%.2f")
+                }
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.white.opacity(0.08), lineWidth: 0.5)
+                )
+        )
+        .foregroundStyle(.white)
     }
 
     @ViewBuilder
