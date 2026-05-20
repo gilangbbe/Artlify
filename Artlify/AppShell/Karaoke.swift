@@ -234,6 +234,35 @@ struct KaraokeOverlay: View {
     /// running. Useful for installations where the giant centred
     /// lyric overpowers the visual.
     var showCurrentLine: Bool = true
+    /// Layer 1: giant dim ghost glyph fragments scattered across the
+    /// canvas. Toggle off for a cleaner, less-busy lyric.
+    var showWorldFragments: Bool = true
+    /// Layer 2: prev / next lyric lines drifting off-axis.
+    var showSatellites: Bool = true
+    /// Layer 4a: VHS-style horizontal slice tear that flashes through
+    /// the focal line on transients.
+    var showSliceTear: Bool = true
+    /// Layer 4b: wide soft radial bloom behind the focal line.
+    var showBloom: Bool = true
+    /// Global camera shake on the overlay (translates *all* layers).
+    /// Disable for clean recordings where the shake reads as
+    /// jpeg-noise rather than emphasis.
+    var showCamShake: Bool = true
+    /// Master "chaos" multiplier. Scales the per-glyph explosion,
+    /// jitter, micro-rotation, and the camera-shake envelope. 1 =
+    /// shipping default, 0 = perfectly stationary glyphs, 2 = louder.
+    var intensity: Double = 1.0
+    /// Extra multiplier on the chromatic RGB-split distance. 1 =
+    /// shipped default; bump up for the obvious VHS look or down to
+    /// near 0 for a clean monochrome render.
+    var chromaticSplit: Double = 1.0
+    /// Base font size for the focal current-line text. Audio level
+    /// still adds up to ~8 pt on top, same as before.
+    var fontSize: Double = 36
+    /// Vertical position of the focal line as a fraction of the
+    /// view height (0 = top, 1 = bottom). 0.78 is the shipped
+    /// default — below the body silhouette, above the bottom HUD.
+    var verticalPosition: Double = 0.78
     /// 0..1 normalised broadband level — drives base amplitudes.
     var audioLevel: Double = 0
     /// 0..1 low-band energy — drives the bass "breathing" of the
@@ -267,44 +296,53 @@ struct KaraokeOverlay: View {
             let next = (i + 1 < lines.count) ? lines[i + 1].text : ""
 
             // ---- Global camera shake (translates everything below).
-            let shakeMag = CGFloat(2 + 26 * shake)
-            let shakeX = CGFloat(sin(nowT * 47.0)) * shakeMag * CGFloat(shake)
+            let shakeAmt = showCamShake ? shake * intensity : 0
+            let shakeMag = CGFloat(2 + 26 * shakeAmt)
+            let shakeX = CGFloat(sin(nowT * 47.0)) * shakeMag * CGFloat(shakeAmt)
             let shakeY = CGFloat(cos(nowT * 53.0)) * shakeMag * 0.6
-                        * CGFloat(shake)
+                        * CGFloat(shakeAmt)
             var ctx = ctx
             ctx.translateBy(x: shakeX, y: shakeY)
 
             // Position the karaoke focal point low so it doesn't fight
             // the body silhouette in the centre.
-            let centerY = size.height * 0.78
+            let centerY = size.height * CGFloat(min(max(verticalPosition, 0), 1))
 
             // ---- (1) World ghost fragments behind everything.
-            drawWorldFragments(of: curr, ctx: ctx, size: size,
-                               lineIndex: i, centerY: centerY)
+            if showWorldFragments {
+                drawWorldFragments(of: curr, ctx: ctx, size: size,
+                                   lineIndex: i, centerY: centerY)
+            }
 
             // ---- (4b) Radial bloom behind the current line.
-            drawBloom(at: CGPoint(x: size.width / 2, y: centerY),
-                      ctx: ctx, size: size)
+            if showBloom {
+                drawBloom(at: CGPoint(x: size.width / 2, y: centerY),
+                          ctx: ctx, size: size)
+            }
 
             // ---- (2) Prev / next satellites (parallax drift).
-            if !prev.isEmpty {
-                drawSatellite(prev, ctx: ctx, size: size,
-                              anchor: CGPoint(x: size.width * 0.18,
-                                              y: centerY - 110),
-                              fontSize: 16, opacity: 0.22,
-                              drift: -1)
-            }
-            if !next.isEmpty {
-                drawSatellite(next, ctx: ctx, size: size,
-                              anchor: CGPoint(x: size.width * 0.82,
-                                              y: centerY + 92),
-                              fontSize: 16, opacity: 0.22,
-                              drift: 1)
+            if showSatellites {
+                if !prev.isEmpty {
+                    drawSatellite(prev, ctx: ctx, size: size,
+                                  anchor: CGPoint(x: size.width * 0.18,
+                                                  y: centerY - 110),
+                                  fontSize: 16, opacity: 0.22,
+                                  drift: -1)
+                }
+                if !next.isEmpty {
+                    drawSatellite(next, ctx: ctx, size: size,
+                                  anchor: CGPoint(x: size.width * 0.82,
+                                                  y: centerY + 92),
+                                  fontSize: 16, opacity: 0.22,
+                                  drift: 1)
+                }
             }
 
             // ---- (4a) Transient horizontal slice tear (drawn under
             //      the current line so the glyphs sit on top of it).
-            drawSliceTear(ctx: ctx, size: size, centerY: centerY)
+            if showSliceTear {
+                drawSliceTear(ctx: ctx, size: size, centerY: centerY)
+            }
 
             // ---- (3) Current line — chromatic + chaos + highlight.
             if showCurrentLine, !curr.isEmpty {
@@ -434,12 +472,12 @@ struct KaraokeOverlay: View {
                                  ctx: GraphicsContext,
                                  size: CGSize,
                                  centerY: CGFloat) {
-        let fontSize: CGFloat = 36 + CGFloat(8 * audioLevel)
-        let font = Font.custom("starjhol", size: fontSize)
+        let fontSizeBase: CGFloat = CGFloat(fontSize) + CGFloat(8 * audioLevel)
+        let font = Font.custom("starjhol", size: fontSizeBase)
         let chars = Array(text)
 
         // Per-glyph measure.
-        let measureBox = CGSize(width: 200, height: fontSize * 2)
+        let measureBox = CGSize(width: 200, height: fontSizeBase * 2)
         let widths: [CGFloat] = chars.map { ch in
             ctx.resolve(Text(String(ch)).font(font))
                 .measure(in: measureBox).width
@@ -453,8 +491,10 @@ struct KaraokeOverlay: View {
 
         // Chromatic split scales with the broadband level and gets
         // a sharp kick on transients — the line literally tears open
-        // on every beat.
+        // on every beat. `chromaticSplit` is a user-tunable extra
+        // multiplier on top of the audio-driven base.
         let splitBase = CGFloat(2 + 14 * audioLevel + 28 * audioTransient)
+                      * CGFloat(max(0, chromaticSplit))
         let splitX = splitBase
         let splitY = splitBase * 0.35
 
@@ -479,13 +519,15 @@ struct KaraokeOverlay: View {
 
             // Transient explosion: glyphs jolt outward from the line
             // centre on attacks. Sign comes from per-char noise so
-            // they scatter rather than all move the same way.
-            let explode = CGFloat(audioTransient) * 18 * CGFloat(h)
-            let yJolt = CGFloat(audioTransient) * 10 * CGFloat(pseudoNoise(idx + 17))
+            // they scatter rather than all move the same way. The
+            // `intensity` knob scales the whole chaos package.
+            let chaos = CGFloat(max(0, intensity))
+            let explode = CGFloat(audioTransient) * 18 * CGFloat(h) * chaos
+            let yJolt = CGFloat(audioTransient) * 10 * CGFloat(pseudoNoise(idx + 17)) * chaos
 
             // Micro-rotation, also seeded by the per-char noise so
             // adjacent glyphs tilt opposite ways.
-            let rot = CGFloat(h) * (0.04 + 0.18 * CGFloat(audioTransient))
+            let rot = CGFloat(h) * (0.04 + 0.18 * CGFloat(audioTransient)) * chaos
 
             // Highlight: lit chars get colour, unlit chars stay grey.
             // We treat the wipe as a sub-pixel boundary so motion is
@@ -532,7 +574,7 @@ struct KaraokeOverlay: View {
 
         // Soft inner glow underline that flickers with transients —
         // gives the eye a horizon line to anchor the chaos to.
-        let underlineY = centerY + fontSize * 0.65
+        let underlineY = centerY + fontSizeBase * 0.65
         let alpha = 0.25 + 0.55 * audioLevel + 0.40 * audioTransient
         let rect = CGRect(x: startX - 16, y: underlineY - 1,
                           width: totalW + 32, height: 2)
@@ -643,6 +685,14 @@ struct HeadLyricBlob: View {
     let store: KaraokeStore
     /// Latest Vision frame — we read the `nose` joint to find the head.
     var frame: VisionFrame?
+    /// Base font size of the lyric inside the blob. Audio level adds
+    /// a couple of points on top.
+    var fontSize: Double = 15
+    /// Multiplier on the head-to-blob anchor offset (both axes).
+    /// 1 = shipped default (~170 px horizontal, ~180 px above the
+    /// head), 0.5 hugs the head, 1.5 floats it further away. Clamped
+    /// at the view edges by the existing pad logic.
+    var offsetRadius: Double = 1.0
     var audioLevel: Double = 0
     var audioLow: Double = 0
     var audioMid: Double = 0
@@ -697,8 +747,9 @@ struct HeadLyricBlob: View {
             // person stands to one side of the frame.
             let onLeft = head.x > size.width * 0.5
             let sideSign: CGFloat = onLeft ? -1 : 1
-            let baseOffX: CGFloat = 170 * sideSign
-            let baseOffY: CGFloat = -180
+            let radius = CGFloat(max(0, offsetRadius))
+            let baseOffX: CGFloat = 170 * sideSign * radius
+            let baseOffY: CGFloat = -180 * radius
 
             // Slow float + audio breathing.
             let floatX = CGFloat(sin(nowT * 0.9)) * 10
@@ -870,8 +921,8 @@ struct HeadLyricBlob: View {
 
     private func drawLyric(_ text: String, at center: CGPoint,
                            blobSize: CGSize, ctx: GraphicsContext) {
-        let fontSize: CGFloat = 15 + CGFloat(2 * audioLevel)
-        let font = Font.system(size: fontSize, weight: .heavy,
+        let fontSizePx: CGFloat = CGFloat(fontSize) + CGFloat(2 * audioLevel)
+        let font = Font.system(size: fontSizePx, weight: .heavy,
                                design: .rounded)
 
         // Per-glyph measure + per-char chromatic split, same idea as
@@ -879,7 +930,7 @@ struct HeadLyricBlob: View {
         // without the camera-shake / explosion chaos (this is the
         // pinned annotation, not the focal moment).
         let chars = Array(text)
-        let measureBox = CGSize(width: 200, height: fontSize * 2)
+        let measureBox = CGSize(width: 200, height: fontSizePx * 2)
         let widths: [CGFloat] = chars.map { ch in
             ctx.resolve(Text(String(ch)).font(font))
                 .measure(in: measureBox).width
@@ -934,7 +985,7 @@ struct HeadLyricBlob: View {
         // annotation, not a free-floating sentence. Drawn dim so it
         // doesn't compete with the lyric.
         let caret = Text("▸")
-            .font(.system(size: fontSize * 0.85, weight: .black))
+            .font(.system(size: fontSizePx * 0.85, weight: .black))
             .foregroundColor(.white.opacity(0.45))
         sub.draw(caret,
                  at: CGPoint(x: center.x - totalW / 2 - 14,

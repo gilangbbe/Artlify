@@ -63,6 +63,26 @@ struct ContentView: View {
     /// main karaoke overlay so the user can pick fixed (bottom)
     /// karaoke, head-anchored karaoke, or both at once.
     @State private var headBlobEnabled: Bool = false
+    // ---- Karaoke overlay tunables (Phase I).
+    /// Per-layer toggles for `KaraokeOverlay`.
+    @State private var karaokeFragmentsEnabled: Bool = true
+    @State private var karaokeSatellitesEnabled: Bool = true
+    @State private var karaokeSliceTearEnabled: Bool = true
+    @State private var karaokeBloomEnabled: Bool = true
+    @State private var karaokeShakeEnabled: Bool = true
+    /// Master "chaos" multiplier — scales per-glyph explosion +
+    /// camera shake. 1 = shipped default.
+    @State private var karaokeIntensity: Double = 1.0
+    /// Extra multiplier on the chromatic RGB-split distance.
+    @State private var karaokeChromaticSplit: Double = 1.0
+    /// Base font size of the focal current-line text (px).
+    @State private var karaokeFontSize: Double = 36
+    /// Vertical position of the focal line as a fraction of view
+    /// height (0 = top, 1 = bottom).
+    @State private var karaokeVerticalPosition: Double = 0.78
+    /// HeadLyricBlob font size + head-anchor offset multiplier.
+    @State private var headBlobFontSize: Double = 15
+    @State private var headBlobOffsetRadius: Double = 1.0
     /// Phase 2 UI slice: music search sheet. Opens from the karaoke
     /// row. Backed by `MockMusicCatalog` until LRCLIB lands.
     @State private var showMusicSearch: Bool = false
@@ -219,6 +239,15 @@ struct ContentView: View {
                 GeometryReader { proxy in
                     KaraokeOverlay(store: karaoke,
                                    showCurrentLine: karaokeCurrentLineEnabled,
+                                   showWorldFragments: karaokeFragmentsEnabled,
+                                   showSatellites: karaokeSatellitesEnabled,
+                                   showSliceTear: karaokeSliceTearEnabled,
+                                   showBloom: karaokeBloomEnabled,
+                                   showCamShake: karaokeShakeEnabled,
+                                   intensity: karaokeIntensity,
+                                   chromaticSplit: karaokeChromaticSplit,
+                                   fontSize: karaokeFontSize,
+                                   verticalPosition: karaokeVerticalPosition,
                                    audioLevel: Double(audio.latest.level),
                                    audioLow: Double(audio.latest.low),
                                    audioMid: Double(audio.latest.mid),
@@ -233,6 +262,8 @@ struct ContentView: View {
                 GeometryReader { proxy in
                     HeadLyricBlob(store: karaoke,
                                   frame: vision.latestFrame,
+                                  fontSize: headBlobFontSize,
+                                  offsetRadius: headBlobOffsetRadius,
                                   audioLevel: Double(audio.latest.level),
                                   audioLow: Double(audio.latest.low),
                                   audioMid: Double(audio.latest.mid),
@@ -743,6 +774,90 @@ struct ContentView: View {
         }
     }
 
+    /// Karaoke visualiser controls (Phase I). Surfaced inside the
+    /// music popover via `musicMenuContent`. Master enable for the
+    /// overlay + head blob, plus per-layer toggles (fragments,
+    /// satellites, slice tear, bloom, camera shake, focal line) and
+    /// the four global tunables (intensity, chromatic split, font
+    /// size, vertical position). Head-blob font + offset live at
+    /// the bottom of the card so they're only visible when the head
+    /// blob is on.
+    @ViewBuilder
+    private var karaokeSection: some View {
+        sectionCard(title: "KARAOKE", icon: "music.mic") {
+            HStack(spacing: 8) {
+                Toggle("overlay", isOn: $karaokeEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .onChange(of: karaokeEnabled) { _, on in
+                        if !on { karaokePlaying = false }
+                    }
+                Toggle("head blob", isOn: $headBlobEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                Spacer()
+            }
+            if karaokeEnabled {
+                HStack(spacing: 8) {
+                    Toggle("line", isOn: $karaokeCurrentLineEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .help("Layer 3: big chromatic current line.")
+                    Toggle("fragments", isOn: $karaokeFragmentsEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .help("Layer 1: scattered ghost glyphs in the background.")
+                    Toggle("satellites", isOn: $karaokeSatellitesEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .help("Layer 2: previous/next lyric lines drifting off-axis.")
+                    Spacer()
+                }
+                HStack(spacing: 8) {
+                    Toggle("slice", isOn: $karaokeSliceTearEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .help("Layer 4a: VHS slice tear on transients.")
+                    Toggle("bloom", isOn: $karaokeBloomEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .help("Layer 4b: soft radial halo behind the focal line.")
+                    Toggle("shake", isOn: $karaokeShakeEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .help("Global camera shake on the whole overlay.")
+                    Spacer()
+                }
+                HStack(spacing: 14) {
+                    flashSlider(label: "chaos",
+                                value: $karaokeIntensity,
+                                range: 0...2, fmt: "%.2f")
+                    flashSlider(label: "chroma",
+                                value: $karaokeChromaticSplit,
+                                range: 0...3, fmt: "%.2f")
+                }
+                HStack(spacing: 14) {
+                    flashSlider(label: "font",
+                                value: $karaokeFontSize,
+                                range: 18...96, fmt: "%.0f")
+                    flashSlider(label: "y pos",
+                                value: $karaokeVerticalPosition,
+                                range: 0.1...0.95, fmt: "%.2f")
+                }
+            }
+            if headBlobEnabled {
+                HStack(spacing: 14) {
+                    flashSlider(label: "blob font",
+                                value: $headBlobFontSize,
+                                range: 10...40, fmt: "%.0f")
+                    flashSlider(label: "blob offset",
+                                value: $headBlobOffsetRadius,
+                                range: 0.3...2.0, fmt: "%.2f")
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private var depthAsciiSection: some View {
         sectionCard(title: "ASCII SCENE DEPTH", icon: "square.stack.3d.up.fill") {
@@ -1166,23 +1281,9 @@ struct ContentView: View {
 
                 Divider().opacity(0.3)
 
-                // Karaoke overlay toggles.
-                HStack(spacing: 8) {
-                    Toggle("karaoke", isOn: $karaokeEnabled)
-                        .toggleStyle(.button)
-                        .controlSize(.small)
-                        .onChange(of: karaokeEnabled) { _, on in
-                            if !on { karaokePlaying = false }
-                        }
-                    Toggle("head blob", isOn: $headBlobEnabled)
-                        .toggleStyle(.button)
-                        .controlSize(.small)
-                    Toggle("layer 3 lyric", isOn: $karaokeCurrentLineEnabled)
-                        .toggleStyle(.button)
-                        .controlSize(.small)
-                        .help("Toggle the big chromatic current-line text in the karaoke overlay.")
-                    Spacer()
-                }
+                // Karaoke overlay controls: enable + per-layer
+                // toggles + tunables for the lyric visualiser.
+                karaokeSection
             }
             .padding(14)
             Spacer()

@@ -15,6 +15,48 @@ Entry template:
 
 ---
 
+## 2026-05-19 — Karaoke control surface (Phase I)
+
+**Decision / change:**
+Promoted the karaoke visualiser from a fire-and-forget overlay with three inline toggles to a fully-tunable HUD section. The old `musicMenuContent` row (`karaoke` / `head blob` / `layer 3 lyric` as `.button`-style toggles, no sliders) is replaced by a proper `sectionCard(title: "KARAOKE", icon: "music.mic")` mirroring the `asciiDepthSection` / `depthAsciiSection` pattern shipped in Phases G/H.
+
+Knobs added to [Artlify/AppShell/Karaoke.swift](Artlify/AppShell/Karaoke.swift):
+
+`KaraokeOverlay` (struct, ~30 new lines of stored props):
+- `showWorldFragments / showSatellites / showSliceTear / showBloom / showCamShake: Bool = true` — per-layer kill switches. The five `draw…` calls inside `body` are now gated; the shake envelope is zeroed instead of multiplied so even sub-pixel jitter is gone when off.
+- `intensity: Double = 1.0` — master "chaos" multiplier. Threaded into the camera-shake target (`shakeAmt = shake * intensity`) and into the per-glyph `explode` / `yJolt` / micro-rotation inside `drawCurrentLine` via a local `chaos = max(0, intensity)`. At `intensity = 0` glyphs sit perfectly still even on transients; at `2` the line bursts twice as hard.
+- `chromaticSplit: Double = 1.0` — extra multiplier on `splitBase` inside `drawCurrentLine`. Lets the user dial the RGB-shift down to ~mono or up past the shipped default without rebuilding.
+- `fontSize: Double = 36` — base font size of the focal line. The audio-driven `+ 8 * audioLevel` term still adds on top so the line breathes the same way. The underline horizon now reads `centerY + fontSizeBase * 0.65` so it tracks the new size.
+- `verticalPosition: Double = 0.78` — focal-line Y as a fraction of view height; clamped to `0…1` at the call site. Defaults bit-identical to the prior hard-coded `0.78`.
+
+`HeadLyricBlob` (struct, 2 new props):
+- `fontSize: Double = 15` — base size for the in-blob lyric text. Local `fontSizePx` shadows the struct prop inside `drawLyric` to avoid the property/local name collision; the caret + glow underline pick up the new size too.
+- `offsetRadius: Double = 1.0` — single scalar multiplier on the head-to-blob anchor (`baseOffX = 170 * sideSign * radius`, `baseOffY = -180 * radius`). The existing on-screen padding logic still clamps the anchor at the view edges so values up to ~2 stay safe.
+
+Defaults match the previous magic numbers bit-for-bit, so a fresh app launch (or any user who never opens the music popover) sees the exact same overlay as Phase H.
+
+[Artlify/ContentView.swift](Artlify/ContentView.swift):
+- Added 11 `@State` props next to the existing karaoke state: 5 per-layer Bools, `karaokeIntensity`, `karaokeChromaticSplit`, `karaokeFontSize`, `karaokeVerticalPosition`, `headBlobFontSize`, `headBlobOffsetRadius`.
+- Threaded all 11 through the `KaraokeOverlay` and `HeadLyricBlob` invocations.
+- New `private var karaokeSection: some View` (~85 lines): three toggle rows (master `overlay` / `head blob`; then layer toggles `line` / `fragments` / `satellites`; then `slice` / `bloom` / `shake`), two `flashSlider` rows (`chaos` 0…2, `chroma` 0…3 and `font` 18…96, `y pos` 0.1…0.95), plus a conditional head-blob row (`blob font` 10…40, `blob offset` 0.3…2.0). The card collapses to just the master toggles when the overlay is off, mirroring `asciiDepthSection`'s "show sliders only when enabled" pattern.
+- The new card replaces the three inline `Toggle(…, .toggleStyle(.button))` rows at the bottom of `musicMenuContent` — the `.onChange(of: karaokeEnabled)` handler that stops playback when the user kills the overlay is preserved on the new switch.
+
+**Reason:**
+Every visual parameter that was previously a hard-coded magic number deep inside `drawCurrentLine` / `drawBloom` / `drawWorldFragments` is now reachable from the HUD without a recompile. The five hidden layers were the biggest pain — they're all on by default, but on a long Apple-Music set the slice-tear and per-frame camera shake compound into visual fatigue; per-layer kill switches let the user A/B the cinematic look against a clean line. The two intensity knobs (`chaos`, `chroma`) cover the long tail of "looks great on a beat-heavy track, screams on a ballad" complaints by letting the user just dial the reactivity down for soft material. Font + Y position were the most-requested tweaks for projector setups where the shipped `0.78 * height` lands behind the user's body — the slider goes from `0.10` (top quarter) to `0.95` (just above the HUD), covering both seated and standing framings.
+
+Defaults preserve the existing rendering bit-identically so this change is risk-free for existing users. The card lives inside the music popover (the only HUD entry point that already deals with karaoke transport) rather than the art popover so all music-related controls stay co-located.
+
+**Impact:**
+`BUILD SUCCEEDED` on `xcodebuild … -destination 'platform=macOS' build`. No new files, no `project.pbxproj` edits. Two files touched: `Karaoke.swift` (+ ~30 lines of properties + the gating / multipliers) and `ContentView.swift` (+ ~110 lines: 11 state vars, new `karaokeSection`, wired call sites, deleted inline 3-toggle row). HUD vertical stack grows by one card; popover already scrolls so no layout regression.
+
+**Follow-up:**
+- Colour pickers per layer (current line, satellite, bloom hue, fragment tint) — currently the chromatic palette is hard-baked as red-green-blue triads inside `drawCurrentLine` / `drawSatellite` / `drawBlob`.
+- Font picker — the focal line is locked to the bundled `starjhol` typeface; could expose a string-name slot, but only worth doing if a second display font ships.
+- Persist all these knobs (and the existing ascii/depth ones) to `UserDefaults` so the HUD survives an app relaunch — right now every restart resets to the shipped defaults.
+- `wordRate` on `DepthAsciiSceneOverlay` is still inert (noted in Phase H follow-up); same pattern (knob present in HUD, no consumer) is worth a sweep when wiring persistence.
+
+---
+
 ## 2026-05-19 — ASCII depth pass: Metal renderer + audio-reactive counter-depth (Phase H)
 
 **Decision / change:**
