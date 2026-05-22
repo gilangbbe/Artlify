@@ -3,8 +3,9 @@
 //  Artlify / GameKit — universe-tune branch
 //
 //  Full-screen search UI for Apple Music catalog songs.
-//  Also contains TileSong.fromAppleMusic(_:) which generates a
-//  deterministic tile pattern from song metadata (title hash + duration).
+//  TileSong.fromAppleMusic(_:) generates an 8th-note beat-grid tile pattern
+//  from the song's real BPM and key signature, fetched from the Apple Music
+//  REST catalog API via MusicDataRequest (auth handled automatically).
 //
 //  Requires: com.apple.developer.musickit entitlement + macOS authorization.
 //
@@ -15,11 +16,13 @@ import MusicKit
 // MARK: - TileSong factory
 
 extension TileSong {
-    /// Generates a TileSong whose tile pattern is seeded from the song's
-    /// title + artist hash, so the same song always produces the same layout.
-    /// BPM defaults to 120 — MusicKit's public API does not expose tempo.
+    /// Builds a TileSong from an Apple Music catalog track.
+    /// Uses real BPM and key signature when available from extended attributes;
+    /// falls back to 120 BPM / C major when the catalog omits them.
+    /// Tile pattern is an 8th-note beat grid seeded from title+artist hash so
+    /// the same song always produces the same layout.
     static func fromAppleMusic(_ handle: AppleMusicHandle) -> TileSong {
-        let bpm: Double = 120.0
+        let bpm     = handle.tempo ?? 120.0
         let beatDur = 60.0 / bpm
         let totalBeats: Double
         if let dur = handle.duration, dur > 0 {
@@ -32,15 +35,41 @@ extension TileSong {
             handle.title.hashValue &+ handle.artistName.hashValue
         )))
 
+        // 8th-note beat grid.  Each step consumes 3 RNG values unconditionally
+        // so lane/duration choices stay deterministic regardless of which steps
+        // happen to spawn tiles.
+        let stepsPerBeat    = 2
+        let totalSteps      = Int(totalBeats) * stepsPerBeat
+        let stepSize        = 1.0 / Double(stepsPerBeat)
+        let durChoices: [Double] = [0.5, 1.0, 1.0, 1.5]
         var events: [NoteEvent] = []
-        var beat = 0.0
-        let durChoices: [Double] = [0.5, 1.0, 1.0, 1.0, 1.5, 2.0]
-        while beat < totalBeats - 1.5 {
+        // Minimum gap between any two tiles so they never appear at the same
+        // horizontal level — guarantees the player can always catch one before
+        // the next arrives.  1 beat gives ~0.22 UV separation at the slowest
+        // supported tempo (60 BPM) and is clearly visible at any BPM.
+        let minBeatGap: Double = 1.0
+        var lastSpawnedBeat: Double = -minBeatGap
+
+        for step in 0..<totalSteps {
+            let currentBeat = Double(step) * stepSize
+            let beatInBar = step % (stepsPerBeat * 4)
+            // Density out of 8: strong beats ~87 %, backbeats ~62 %, offbeats ~37 %
+            let threshold: UInt64
+            if beatInBar == 0 || beatInBar == stepsPerBeat * 2 {
+                threshold = 7
+            } else if beatInBar % stepsPerBeat == 0 {
+                threshold = 5
+            } else {
+                threshold = 3
+            }
+            let roll    = rng.next() % 8
             let lane    = Int(rng.next() % 8)
             let noteDur = durChoices[Int(rng.next() % UInt64(durChoices.count))]
-            events.append(NoteEvent(beat: beat, lane: lane, duration: noteDur))
-            // Gap: 0.5–1.5 beats between tile start times
-            beat += 0.5 + Double(rng.next() % 4) * 0.25
+            if roll < threshold && currentBeat >= lastSpawnedBeat + minBeatGap {
+                events.append(NoteEvent(beat: currentBeat,
+                                        lane: lane, duration: noteDur))
+                lastSpawnedBeat = currentBeat
+            }
         }
 
         // 8 hues evenly spaced on the colour wheel, rotated by title hash.
@@ -51,14 +80,62 @@ extension TileSong {
         }
 
         return TileSong(
-            title: handle.title,
-            composer: handle.artistName,
-            bpm: bpm,
-            events: events.sorted { $0.beat < $1.beat },
-            laneNotes: [60, 62, 64, 65, 67, 69, 71, 72], // C major scale — muted in Apple Music mode
-            laneColors: colors,
+            title:            handle.title,
+            composer:         handle.artistName,
+            bpm:              bpm,
+            events:           events.sorted { $0.beat < $1.beat },
+            laneNotes:        midiScale(forKeySignature: handle.keySignature),
+            laneColors:       colors,
             appleMusicHandle: handle
         )
+    }
+
+    // MARK: Scale / key helpers
+
+    /// Returns 8 MIDI notes spanning one octave of the scale implied by
+    /// `key` (e.g. "C", "F#m", "Bb", "A Minor").  Falls back to C major.
+    static func midiScale(forKeySignature key: String?) -> [UInt8] {
+        guard let key = key?.trimmingCharacters(in: .whitespaces), !key.isEmpty else {
+            return [60, 62, 64, 65, 67, 69, 71, 72] // C major
+        }
+        let lower   = key.lowercased()
+        let isMinor = lower.hasSuffix("m") || lower.contains("minor")
+        var rootStr: String
+        if lower.contains("minor") {
+            rootStr = key.replacingOccurrences(of: "minor", with: "", options: .caseInsensitive)
+        } else if lower.contains("major") {
+            rootStr = key.replacingOccurrences(of: "major", with: "", options: .caseInsensitive)
+        } else if isMinor {
+            rootStr = String(key.dropLast()) // strip trailing "m"
+        } else {
+            rootStr = key
+        }
+        rootStr = rootStr.trimmingCharacters(in: .whitespaces)
+        let root      = midiRoot(rootStr)
+        let intervals: [UInt8] = isMinor
+            ? [0, 2, 3, 5, 7,  8, 10, 12] // natural minor
+            : [0, 2, 4, 5, 7,  9, 11, 12] // major
+        return intervals.map { UInt8(clamping: Int(root) + Int($0)) }
+    }
+
+    private static func midiRoot(_ name: String) -> UInt8 {
+        switch name.uppercased()
+            .replacingOccurrences(of: "♭", with: "B")
+            .replacingOccurrences(of: "♯", with: "#") {
+        case "C":         return 60
+        case "C#", "DB":  return 61
+        case "D":         return 62
+        case "D#", "EB":  return 63
+        case "E":         return 64
+        case "F":         return 65
+        case "F#", "GB":  return 66
+        case "G":         return 67
+        case "G#", "AB":  return 68
+        case "A":         return 69
+        case "A#", "BB":  return 70
+        case "B":         return 71
+        default:          return 60
+        }
     }
 }
 
@@ -87,6 +164,7 @@ struct AppleMusicBrowser: View {
     @State private var searchError: String? = nil
     @State private var debounceTask: Task<Void, Never>? = nil
     @State private var hovered: String? = nil
+    @State private var loadingSongID: String? = nil
 
     var body: some View {
         ZStack {
@@ -222,13 +300,7 @@ struct AppleMusicBrowser: View {
         let accent   = Color(hue: baseHue, saturation: 0.80, brightness: 1.0)
 
         Button {
-            let handle = AppleMusicHandle(
-                musicItemID: song.id.rawValue,
-                title: song.title,
-                artistName: song.artistName,
-                duration: song.duration
-            )
-            onSelect(TileSong.fromAppleMusic(handle))
+            Task { await selectSong(song) }
         } label: {
             HStack(spacing: 12) {
                 // Lane-colour preview strips
@@ -260,10 +332,16 @@ struct AppleMusicBrowser: View {
                         .foregroundStyle(.white.opacity(0.35))
                 }
 
-                Text(isHov ? "▶" : "")
-                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    .foregroundStyle(accent)
-                    .frame(width: 20)
+                Group {
+                    if loadingSongID == song.id.rawValue {
+                        ProgressView().scaleEffect(0.6).tint(accent)
+                    } else {
+                        Text(isHov ? "▶" : "")
+                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                            .foregroundStyle(accent)
+                    }
+                }
+                .frame(width: 20)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -271,7 +349,65 @@ struct AppleMusicBrowser: View {
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent.opacity(isHov ? 0.5 : 0), lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .disabled(loadingSongID != nil)
         .onHover { hovered = $0 ? song.id.rawValue : nil }
+    }
+
+    // MARK: - Song selection
+
+    private func selectSong(_ song: Song) async {
+        loadingSongID = song.id.rawValue
+        defer { loadingSongID = nil }
+
+        var fetchedTempo: Double? = nil
+        var fetchedKey: String?   = nil
+
+        if let (t, k) = try? await fetchExtendedAttributes(songID: song.id.rawValue) {
+            fetchedTempo = t
+            fetchedKey   = k
+        }
+
+        let handle = AppleMusicHandle(
+            musicItemID:  song.id.rawValue,
+            title:        song.title,
+            artistName:   song.artistName,
+            duration:     song.duration,
+            tempo:        fetchedTempo,
+            keySignature: fetchedKey
+        )
+        onSelect(TileSong.fromAppleMusic(handle))
+    }
+
+    /// Calls the Apple Music REST catalog API via MusicDataRequest (which handles auth
+    /// automatically) to read tempo (BPM) and keySignature — attributes that exist in
+    /// the JSON but are not surfaced on MusicKit's Swift Song type.
+    private func fetchExtendedAttributes(songID: String) async throws -> (tempo: Double?, key: String?) {
+        // Resolve the user's storefront; fall back to "us" on any error.
+        var countryCode = "us"
+        if let sfURL = URL(string: "https://api.music.apple.com/v1/me/storefront"),
+           let sfResp = try? await MusicDataRequest(urlRequest: URLRequest(url: sfURL)).response() {
+            struct SFItem: Decodable { let id: String }
+            struct SFResp: Decodable { let data: [SFItem] }
+            if let decoded = try? JSONDecoder().decode(SFResp.self, from: sfResp.data),
+               let first = decoded.data.first {
+                countryCode = first.id
+            }
+        }
+
+        guard let songURL = URL(string: "https://api.music.apple.com/v1/catalog/\(countryCode)/songs/\(songID)") else {
+            return (nil, nil)
+        }
+        let songResp = try await MusicDataRequest(urlRequest: URLRequest(url: songURL)).response()
+
+        struct SongAttrs: Decodable {
+            let tempo: Double?
+            let keySignature: String?
+        }
+        struct SongItem: Decodable { let attributes: SongAttrs }
+        struct SongResp: Decodable { let data: [SongItem] }
+
+        let attrs = try JSONDecoder().decode(SongResp.self, from: songResp.data).data.first?.attributes
+        return (attrs?.tempo, attrs?.keySignature)
     }
 
     // MARK: - Search

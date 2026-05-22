@@ -72,6 +72,7 @@ final class TileEngine {
     private var startTime: CFAbsoluteTime = 0
     private var loopOffset: Double = 0     // running beat offset across loops
     private var nextEventIdx: Int = 0
+    private var nextBgIdx: Int = 0         // index into song.bgNotes
 
     // Joint interpolation: store two consecutive Vision snapshots so we can
     // LERP body positions at 60 Hz even when Vision fires at ~30 Hz.
@@ -106,6 +107,7 @@ final class TileEngine {
         nextEventIdx = 0
         activeTiles = []
         score = 0; combo = 0; totalHits = 0; totalMisses = 0
+        nextBgIdx = 0
         prevJoints = []; currJoints = []
         prevJointTime = 0; currJointTime = 0
     }
@@ -143,6 +145,7 @@ final class TileEngine {
         }
 
         spawnTiles()
+        playBgNotes()
         processCollisions()
         pruneTiles()
         checkSongEnd()
@@ -174,6 +177,19 @@ final class TileEngine {
                 absoluteTargetTime: absTarget
             ))
             nextEventIdx += 1
+        }
+    }
+
+    /// Fire background notes (arpeggios + bass) at their scheduled beat times.
+    /// These play automatically and never spawn tiles.
+    private func playBgNotes() {
+        while nextBgIdx < song.bgNotes.count {
+            let note    = song.bgNotes[nextBgIdx]
+            let absTime = (note.beat + loopOffset) * song.beatDuration
+            guard songTime >= absTime else { break }
+            let sustain = note.duration * song.beatDuration
+            notePlayer.playMIDI(note.midiNote, velocity: 38, durationSeconds: sustain)
+            nextBgIdx += 1
         }
     }
 
@@ -264,15 +280,15 @@ final class TileEngine {
             let height = tileHeight(activeTiles[i])
             let lane   = activeTiles[i].lane
 
-            // Miss: leading edge past bottom → game over
+            // Miss: tile fell past the bottom — melody note is silent, game continues.
             if topY > 1.04 {
                 activeTiles[i].state      = .missed
                 activeTiles[i].missedTime = songTime
                 combo = 0
                 totalMisses += 1
-                notePlayer.playGhost(lane: lane)
-                isGameOver = true
-                return   // stop processing remaining tiles this tick
+                // No ghost note: if you miss the tile the melody is simply absent.
+                // The background arpeggios keep playing via playBgNotes().
+                continue
             }
 
             // Must be (a) bottommost in its lane and (b) at the global front.
@@ -344,13 +360,14 @@ final class TileEngine {
     }
 
     private func checkSongEnd() {
-        // All events must have been spawned...
         guard nextEventIdx >= song.events.count else { return }
-        // ...and every tile resolved (hit tiles are pruned after 0.55 s,
-        // missed tiles trigger isGameOver before we get here, so an empty
-        // activeTiles array here means a perfect clear).
+        guard nextBgIdx    >= song.bgNotes.count else { return }
         guard activeTiles.isEmpty else { return }
-        isSongComplete = true
-        isPlaying      = false
+
+        let tileEnd = song.events.max(by: { $0.beat < $1.beat }).map { $0.beat + $0.duration } ?? 32.0
+        let bgEnd   = song.bgNotes.max(by: { $0.beat < $1.beat }).map { $0.beat + $0.duration } ?? 0.0
+        loopOffset   += max(tileEnd, bgEnd)
+        nextEventIdx  = 0
+        nextBgIdx     = 0
     }
 }

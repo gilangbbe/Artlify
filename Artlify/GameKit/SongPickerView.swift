@@ -8,7 +8,52 @@
 //  onOpenAppleMusic so ContentView can push the browser overlay.
 //
 
+import Combine
 import SwiftUI
+
+// MARK: - Preview controller
+
+@MainActor
+final class SongPreviewController: ObservableObject {
+    @Published private(set) var previewingTitle: String? = nil
+
+    private var task: Task<Void, Never>? = nil
+    private var player: NotePlayer? = nil
+
+    func start(_ song: TileSong) {
+        stop()
+        previewingTitle = song.title
+        let p = NotePlayer(song: song)
+        player = p
+        let events = song.events.filter { $0.beat < 32 }.sorted { $0.beat < $1.beat }
+        let beatDur = song.beatDuration
+        task = Task { [weak self] in
+            var prevBeat = events.first?.beat ?? 0.0
+            for event in events {
+                if Task.isCancelled { break }
+                let gap = (event.beat - prevBeat) * beatDur
+                if gap > 0.005 {
+                    do { try await Task.sleep(for: .seconds(gap)) }
+                    catch { break }
+                }
+                if Task.isCancelled { break }
+                p.play(lane: event.lane)
+                prevBeat = event.beat
+            }
+            await MainActor.run { self?.previewingTitle = nil }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+        player?.teardown()
+        player = nil
+        previewingTitle = nil
+    }
+}
+
+// MARK: - View
 
 struct SongPickerView: View {
     let onSelect: (TileSong) -> Void
@@ -16,6 +61,7 @@ struct SongPickerView: View {
     let onOpenAppleMusic: () -> Void
 
     @State private var hovered: String? = nil
+    @StateObject private var preview = SongPreviewController()
 
     var body: some View {
         ZStack {
@@ -54,7 +100,7 @@ struct SongPickerView: View {
                 }
 
                 // Cancel
-                Button("cancel") { onCancel() }
+                Button("cancel") { preview.stop(); onCancel() }
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.30))
                     .buttonStyle(.plain)
@@ -67,11 +113,12 @@ struct SongPickerView: View {
 
     @ViewBuilder
     private func songCard(_ song: TileSong) -> some View {
-        let isHovered = hovered == song.title
-        let accent    = song.laneColors[song.laneColors.count / 2]
+        let isHovered    = hovered == song.title
+        let isPreviewing = preview.previewingTitle == song.title
+        let accent       = song.laneColors[song.laneColors.count / 2]
 
-        Button { onSelect(song) } label: {
-            VStack(alignment: .leading, spacing: 16) {
+        Button { preview.stop(); onSelect(song) } label: {
+            VStack(alignment: .leading, spacing: 14) {
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text(song.title)
@@ -105,12 +152,25 @@ struct SongPickerView: View {
 
                 Spacer()
 
+                // Preview / stop row
+                Button {
+                    if isPreviewing { preview.stop() } else { preview.start(song) }
+                } label: {
+                    Label(
+                        isPreviewing ? "stop" : "preview",
+                        systemImage: isPreviewing ? "stop.fill" : "waveform"
+                    )
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(isPreviewing ? .orange : .white.opacity(0.40))
+                }
+                .buttonStyle(.plain)
+
                 Text(isHovered ? "▶  play" : "click to play")
                     .font(.system(size: 12, weight: .semibold, design: .monospaced))
                     .foregroundStyle(isHovered ? accent : .white.opacity(0.45))
             }
             .padding(22)
-            .frame(width: 210, height: 220)
+            .frame(width: 210, height: 240)
             .background(
                 RoundedRectangle(cornerRadius: 12)
                     .fill(.white.opacity(isHovered ? 0.06 : 0.03))
@@ -134,7 +194,7 @@ struct SongPickerView: View {
         let isHovered = hovered == "__apple_music__"
 
         Button { onOpenAppleMusic() } label: {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 14) {
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
@@ -183,7 +243,7 @@ struct SongPickerView: View {
                     .foregroundStyle(isHovered ? Color.pink : .white.opacity(0.45))
             }
             .padding(22)
-            .frame(width: 210, height: 220)
+            .frame(width: 210, height: 240)
             .background(
                 RoundedRectangle(cornerRadius: 12)
                     .fill(.white.opacity(isHovered ? 0.06 : 0.03))

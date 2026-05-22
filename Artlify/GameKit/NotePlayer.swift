@@ -45,6 +45,15 @@ final class NotePlayer {
         trigger(lane: lane, velocity: 28, sustainSeconds: 1.2)
     }
 
+    /// Play any arbitrary MIDI note — used for background accompaniment (arpeggios, bass).
+    func playMIDI(_ note: UInt8, velocity: UInt8 = 38, durationSeconds: Double = 0.3) {
+        guard isReady, !isMuted else { return }
+        sampler.startNote(note, withVelocity: velocity, onChannel: 0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + durationSeconds) { [weak self] in
+            self?.sampler.stopNote(note, onChannel: 0)
+        }
+    }
+
     func teardown() {
         for note in laneNotes { sampler.stopNote(note, onChannel: 0) }
         if engine.isRunning { engine.stop() }

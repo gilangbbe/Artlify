@@ -6,10 +6,16 @@ metadata:
   type: project
 ---
 
-Piano Tiles game where the player uses their body (all Vision joints) to hit falling tiles that play Ludovico Einaudi's "Experience" (56 BPM, G major, 4 lanes: G4/B4/D5/G5).
+Piano Tiles game where the player uses their body (all Vision joints) to hit falling tiles that play Ludovico Einaudi's "Experience".
 
-**Files created in `Artlify/GameKit/`:**
-- `TileSong.swift` — 48-beat loop: Section A ostinato (G-B-D-B×4), Section B melody, Section C peak
+**Experience — correct key/tempo (confirmed via web research):**
+- Key: **F# minor** (chord loop: F#m–A–C#m–D, i–III–v–VI)
+- BPM: **92** (not 56; not G major)
+- Lane notes: F#4(66) G#4(68) A4(69) B4(71) C#5(73) D5(74) E5(76) F#5(78)
+- Melody: C#5→E5→F#5(half) / descent E5→C#5→A4 / C#m outline / D-chord peak F#5
+
+**Files in `Artlify/GameKit/`:**
+- `TileSong.swift` — 48-beat loop: Section A ostinato (F#m arpeg ×4), Section B melody, Section C climax
 - `NotePlayer.swift` — AVAudioEngine + AVAudioUnitSampler (GM Grand Piano via macOS DLS) + LargeHall2 reverb
 - `TileEngine.swift` — @Observable game loop at 60Hz; collision = any VisionJoint inside tile UV rect
 - `UniverseTuneOverlay.swift` — Canvas with neon tile rectangles + corner brackets (BlobBoxes aesthetic) + score HUD

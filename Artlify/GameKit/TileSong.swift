@@ -13,12 +13,18 @@ import SwiftUI
 
 struct NoteEvent: Identifiable {
     var id = UUID()
-    /// Beat number from the start of this loop (0-based, quarter-note grid).
     let beat: Double
-    /// Lane index 0–3 into this song's laneNotes/laneColors arrays.
     let lane: Int
-    /// Duration in beats — controls tile height (long note = taller tile).
-    let duration: Double
+    let duration: Double  // beats — controls tile height
+}
+
+/// A background note that plays automatically — not a tile, not interactive.
+/// Carries the raw MIDI pitch so any note (bass, arpeggios below lane range) can play.
+struct BgNote: Identifiable {
+    var id = UUID()
+    let beat: Double
+    let midiNote: UInt8
+    let duration: Double  // beats — controls sustain length
 }
 
 // Plain handle — no MusicKit import required here.
@@ -26,14 +32,19 @@ struct AppleMusicHandle {
     let musicItemID: String
     let title: String
     let artistName: String
-    let duration: TimeInterval?    // nil when unknown
+    let duration: TimeInterval? // nil when unknown
+    let tempo: Double?          // BPM from MusicKit extended attributes; nil = not in catalog
+    let keySignature: String?   // e.g. "C", "F#m", "Bb Minor"; nil = not in catalog
 }
 
 struct TileSong {
     let title: String
     let composer: String
     let bpm: Double
+    /// Tile events — only the main melody.  Each one spawns a falling tile.
     let events: [NoteEvent]
+    /// Background notes — arpeggios and bass.  Auto-play; never become tiles.
+    let bgNotes: [BgNote]
 
     /// MIDI note number per lane (8 values).
     let laneNotes: [UInt8]
@@ -43,13 +54,15 @@ struct TileSong {
     /// Non-nil when this song is backed by an Apple Music catalog track.
     var appleMusicHandle: AppleMusicHandle? = nil
 
-    init(title: String, composer: String, bpm: Double, events: [NoteEvent],
+    init(title: String, composer: String, bpm: Double,
+         events: [NoteEvent], bgNotes: [BgNote] = [],
          laneNotes: [UInt8], laneColors: [Color],
          appleMusicHandle: AppleMusicHandle? = nil) {
         self.title            = title
         self.composer         = composer
         self.bpm              = bpm
         self.events           = events
+        self.bgNotes          = bgNotes
         self.laneNotes        = laneNotes
         self.laneColors       = laneColors
         self.appleMusicHandle = appleMusicHandle
@@ -66,64 +79,69 @@ struct TileSong {
     // -------------------------------------------------------------------------
     // MARK: "Experience" — Ludovico Einaudi  (from "In a Time Lapse", 2013)
     //
-    // 56 BPM, 4/4, quarter-note tile grid.
-    // Lanes: G4(0) A4(1) B4(2) C5(3) D5(4) E5(5) F#5(6) G5(7)
+    // Loaded from "Songs/Ludovico Einaudi - Experience.mid" at runtime via
+    // MIDILoader.  Falls back to the hand-transcribed events if the bundle
+    // resource is missing.
     //
-    // Structure (48-beat loop ≈ 51 s):
-    //   Section A  beats  0–15   Ostinato G–B–D–B with passing fills
-    //   Section B  beats 16–31   Melody enters   ascending G4→G5 phrases
-    //   Section C  beats 32–47   Full melody     all 8 lanes engaged
+    // Key: A major.  Lanes: A4(0) B4(1) C#5(2) D5(3) E5(4) F#5(5) G#5(6) A5(7)
+    // Tempo: 72 BPM intro (beats 0–32) → 80 BPM main body (beats 32–418) →
+    //        ritardando ending.  MIDILoader picks 80 BPM as the canonical tempo.
+    // Full song: ~450 beats (≈5.8 min).  Loops on completion.
     // -------------------------------------------------------------------------
     static let experience: TileSong = {
-        var ev: [NoteEvent] = []
+        // A major scale A4→A5 — the 8 lanes
+        let laneNotes: [UInt8] = [69, 71, 73, 74, 76, 78, 80, 81]
+        //                         A4  B4  C#5 D5  E5  F#5 G#5 A5
 
-        func add(_ beat: Double, _ lane: Int, dur: Double = 1.0) {
-            ev.append(NoteEvent(beat: beat, lane: lane, duration: dur))
-        }
-
-        // Section A: Ostinato (G B D B) on lanes 0,2,4,2 + passing fills on odd lanes
-        for bar in 0..<4 {
-            let b = Double(bar * 4)
-            add(b + 0, 0); add(b + 0.5, 1)
-            add(b + 1, 2); add(b + 1.5, 3)
-            add(b + 2, 4); add(b + 2.5, 3)
-            add(b + 3, 2)
-        }
-
-        // Section B: Ascending melody
-        add(16, 2); add(16.5, 3); add(17, 4); add(17.5, 5)
-        add(18, 7, dur: 1.5); add(19.5, 4)
-        add(20, 2); add(20.5, 1); add(21, 0); add(21.5, 1); add(22, 2); add(23, 4)
-        add(24, 7, dur: 1.5); add(25.5, 5); add(26, 4); add(26.5, 3); add(27, 2)
-        add(28, 7, dur: 1.5); add(29.5, 5); add(30, 4); add(30.5, 2); add(31, 0)
-
-        // Section C: Full melody, all 8 lanes
-        add(32, 2); add(32.5, 3); add(33, 4); add(33.5, 5)
-        add(34, 7, dur: 1.5); add(35.5, 4)
-        add(36, 2); add(36.5, 3); add(37, 4); add(37.5, 5); add(38, 6); add(38.5, 7)
-        add(39, 6)
-        add(40, 5); add(40.5, 4); add(41, 2); add(41.5, 1); add(42, 0); add(43, 2)
-        add(44, 4); add(45, 7, dur: 2.0); add(47, 5); add(47.5, 2)
+        // Prefer MIDI file; fall back to hand-coded events if bundle load fails.
+        // beatLimit 9999 = load the complete ~450-beat song.
+        // MIDILoader separates long notes (melody tiles) from short notes (bg arpeggios + bass).
+        let midi    = MIDILoader.load(resource: "Ludovico Einaudi - Experience",
+                                      laneNotes: laneNotes,
+                                      beatLimit: 9999)
+        let events  = midi?.events  ?? Experience.fallback
+        let bgNotes = midi?.bgNotes ?? []
+        let bpm     = midi?.bpm     ?? 80.0
 
         return TileSong(
             title: "Experience",
             composer: "Ludovico Einaudi",
-            bpm: 56.0,
-            events: ev.sorted { $0.beat < $1.beat },
-            // G4  A4  B4  C5  D5  E5  F#5 G5
-            laneNotes: [67, 69, 71, 72, 74, 76, 78, 79],
+            bpm: bpm,
+            events: events,
+            bgNotes: bgNotes,
+            laneNotes: laneNotes,
             laneColors: [
-                Color(red: 0.20, green: 0.72, blue: 1.00),  // cyan-blue
-                Color(red: 0.10, green: 0.90, blue: 0.82),  // teal
-                Color(red: 0.25, green: 1.00, blue: 0.55),  // spring-green
-                Color(red: 0.72, green: 1.00, blue: 0.20),  // lime
-                Color(red: 1.00, green: 0.80, blue: 0.20),  // gold
-                Color(red: 1.00, green: 0.50, blue: 0.10),  // orange
-                Color(red: 1.00, green: 0.28, blue: 0.75),  // rose-pink
-                Color(red: 0.72, green: 0.22, blue: 1.00),  // violet
+                Color(red: 1.00, green: 0.75, blue: 0.20),  // A4  — amber
+                Color(red: 1.00, green: 0.95, blue: 0.35),  // B4  — yellow
+                Color(red: 0.30, green: 1.00, blue: 0.65),  // C#5 — spring (primary melody)
+                Color(red: 0.20, green: 0.80, blue: 1.00),  // D5  — sky-blue
+                Color(red: 0.45, green: 0.55, blue: 1.00),  // E5  — periwinkle
+                Color(red: 0.72, green: 0.25, blue: 1.00),  // F#5 — violet
+                Color(red: 1.00, green: 0.28, blue: 0.65),  // G#5 — rose
+                Color(red: 1.00, green: 1.00, blue: 1.00),  // A5  — white (octave peak)
             ]
         )
     }()
+
+    // Hand-transcribed fallback extracted from the MIDI file (32-beat phrase)
+    private enum Experience {
+        static let fallback: [NoteEvent] = {
+            var ev: [NoteEvent] = []
+            func add(_ beat: Double, _ lane: Int, dur: Double = 1.0) {
+                ev.append(NoteEvent(beat: beat, lane: lane, duration: dur))
+            }
+            // Core motif: C#5(2) C#5(2) D5(3) C#5(2) × 7 bars + ending
+            add( 0, 2); add( 1, 2); add( 2, 3); add( 3, 2)
+            add( 4, 2); add( 5, 2); add( 6, 3); add( 7, 2)
+            add( 8, 2); add( 9, 2); add(10, 3); add(11, 2)
+            add(12, 2); add(13, 1); add(14, 2); add(15, 3)  // B4 variation
+            add(16, 2); add(17, 2); add(18, 3); add(19, 2)
+            add(20, 2); add(21, 2); add(22, 3); add(23, 2)
+            add(24, 2); add(25, 2); add(26, 3); add(27, 2)
+            add(28, 2); add(29, 1); add(30, 0); add(31, 1)  // C#5 B4 A4 B4
+            return ev
+        }()
+    }
 
     // -------------------------------------------------------------------------
     // MARK: "Für Elise" — Ludwig van Beethoven  (WoO 59, c. 1810)
